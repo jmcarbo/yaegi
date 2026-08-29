@@ -72,5 +72,8 @@ same root cause or safe patch as the other items.
   serialization, nested source-package retry, compiler/export concurrency, and
   compile-only symbol publication are fixed with regressions.
 - Independent final review reports zero material findings.
-- Delivery remains pending until the final commit, push, draft PR, label, and
-  exact-head audit are complete.
+- Implementation commit `7f1ba82427c6c71c04c866f105f3f90cfc4acb7c`
+  is pushed on `jmca/gornesh-yaegi-flows`.
+- Draft PR #1 is open against `master` and carries only the required
+  `includes-ai-code` label. The exact final-head audit follows this
+  documentation-only delivery update.

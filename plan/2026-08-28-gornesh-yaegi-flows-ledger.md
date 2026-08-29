@@ -207,3 +207,12 @@
   complex map-reduce passes normal `-count=10`, race `-count=5`. The dirty
   Gornesh package's broader run also has two unrelated user-work failures in
   `session_cover_test.go`; no Gornesh files were changed.
+
+## Delivery
+
+- Implementation commit `7f1ba82427c6c71c04c866f105f3f90cfc4acb7c`
+  was pushed to `origin/jmca/gornesh-yaegi-flows`.
+- Draft PR #1 (`https://github.com/jmcarbo/yaegi/pull/1`) targets `master` and
+  carries only the required `includes-ai-code` label.
+- This documentation-only update records the completed delivery state; the
+  final local, remote, and PR head equality is audited after it is pushed.
