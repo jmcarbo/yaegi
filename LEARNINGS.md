@@ -25,3 +25,19 @@
 - Interpreted-to-native calls must not allocate a fresh MakeFunc wrapper per
   call; memoize the bound wrapper per (value, root, cancel, signature) on the
   metadata group or alias registration grows the registry per call.
+- Known limitation: a canceled evaluation's worker may still be unwinding its
+  deferred calls when a later evaluation starts, and host-shared global
+  containers (published via Globals/Symbols or crossing a native boundary) are
+  shared by reference across the detached root. If the canceled worker's
+  defers and the later evaluation write the same container concurrently, the
+  process can die with a fatal concurrent map write. Deferring or sharing are
+  both load-bearing: defers of canceled runs drive ownership publication, and
+  shared references are the host-visibility contract. A sound fix needs a
+  drain barrier for actively-running zombie workers (proceeding only while
+  they are blocked in native code), which is a semantic change to document and
+  design deliberately.
+- Known quirk (pre-dates the ownership work): in REPL/statement mode, a
+  channel receive in return position (`return <-ch`) inside a declared
+  function panics with "reflect: reflect.Value.Set using unaddressable
+  value"; receiving into a variable first works. The interpreter test suite
+  never exercised return-position receives.
