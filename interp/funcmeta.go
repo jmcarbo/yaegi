@@ -99,6 +99,12 @@ const (
 // withFuncSweepWriteFromExec upgrades the execution fence while escape
 // metadata changes, then restores the read fence used by the CFG runner.
 func (interp *Interpreter) withFuncSweepWriteFromExec(run func()) {
+	if interp.funcSweepExclusive.Load() > 0 {
+		// A canceled worker's deferred phase holds the fence exclusively;
+		// the write upgrade is already satisfied on this goroutine.
+		run()
+		return
+	}
 	interp.funcSweepMu.RUnlock()
 	interp.funcSweepMu.Lock()
 	defer func() {

@@ -496,14 +496,29 @@ type Interpreter struct {
 	// call to relinquish ownership before a native call returns. A later run can
 	// then detach the canceled root without sharing its mutable cancel owner.
 	executionGate chan struct{}
-	mutex         sync.RWMutex
-	funcMu        sync.RWMutex
-	funcSweepMu   sync.RWMutex
-	funcMeta      map[reflect.Value]interpretedFuncMeta
-	directFuncs   map[directFuncActivationKey]reflect.Value
-	ownedObjects  map[objectKey]*ownedObject
-	ownedChannels map[uintptr]*ownedChannel
-	panicTokens   map[*ownedPanicToken]struct{}
+	// zombieBarrier serializes the deferred phase of a canceled (zombie)
+	// worker against the whole execution of a later evaluation. A canceled
+	// worker's deferred calls still run (they drive ownership publication),
+	// but the evaluation they belonged to has already returned, so the gate
+	// no longer excludes them; the barrier closes that window. Active runs
+	// hold it for their entire execution via their run token; a zombie's
+	// deferred phase no longer matches the current token and must take it.
+	// zombieDefers counts canceled workers currently unwinding their
+	// deferred calls. While it is positive, every interpreted execution step
+	// holds the funcSweep fence exclusively: a zombie's deferred writes must
+	// not overlap a later evaluation's steps on shared containers. Native
+	// stretches still release the fence, so a zombie defer blocked in a host
+	// call never blocks later evaluations.
+	zombieDefers       atomic.Int64
+	funcSweepExclusive atomic.Int64 // depth of exclusive funcSweepMu holders (zombie deferred steps)
+	mutex              sync.RWMutex
+	funcMu             sync.RWMutex
+	funcSweepMu        sync.RWMutex
+	funcMeta           map[reflect.Value]interpretedFuncMeta
+	directFuncs        map[directFuncActivationKey]reflect.Value
+	ownedObjects       map[objectKey]*ownedObject
+	ownedChannels      map[uintptr]*ownedChannel
+	panicTokens        map[*ownedPanicToken]struct{}
 	// hostSharedEstimate counts owned objects currently flagged hostShared.
 	// It is maintained exactly under funcMu so the per-write ownership scans
 	// can return in constant time while no object is host-shared.

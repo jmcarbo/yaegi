@@ -388,35 +388,53 @@ func runCfg(n *node, f *frame, funcNode, callNode *node) {
 		deferred := f.deferred
 		f.deferred = nil
 		f.mutex.Unlock()
-		for _, deferredCall := range deferred {
-			val := deferredCall.values
-			func() {
-				defer func() {
-					if deferredPanic := recover(); deferredPanic != nil {
-						f.mutex.RLock()
-						previous := f.recovered
-						f.mutex.RUnlock()
-						if previous != nil {
-							f.interp.rollbackInterpretedFuncPanicEscape(previous)
-						}
-						f.mutex.Lock()
-						f.recovered = deferredPanic
-						f.mutex.Unlock()
-					}
-				}()
-				if invoke, ok := f.interp.interpretedFunc(val[0]); ok {
-					invoke(val[1:], f.root, nil)
-				} else if deferredCall.exclusive {
-					f.interp.funcSweepMu.Lock()
-					func() {
-						defer f.interp.funcSweepMu.Unlock()
-						val[0].Call(val[1:])
-					}()
-				} else {
-					val[0].Call(val[1:])
+		// A canceled evaluation's worker unwinds its deferred calls after the
+		// API call has returned and released the execution gate, so its
+		// interpreted writes could overlap a later evaluation. While its
+		// deferred calls run, the funcSweep fence is held exclusively: their
+		// interpreted steps exclude every other execution step, while native
+		// stretches still release the fence. Only the root's own deferred
+		// section toggles the flag; nested frames unwind inside it.
+		zombiePhase := f.root != nil && f.root.canceled()
+		if zombiePhase {
+			f.interp.zombieDefers.Add(1)
+		}
+		func() {
+			defer func() {
+				if zombiePhase {
+					f.interp.zombieDefers.Add(-1)
 				}
 			}()
-		}
+			for _, deferredCall := range deferred {
+				val := deferredCall.values
+				func() {
+					defer func() {
+						if deferredPanic := recover(); deferredPanic != nil {
+							f.mutex.RLock()
+							previous := f.recovered
+							f.mutex.RUnlock()
+							if previous != nil {
+								f.interp.rollbackInterpretedFuncPanicEscape(previous)
+							}
+							f.mutex.Lock()
+							f.recovered = deferredPanic
+							f.mutex.Unlock()
+						}
+					}()
+					if invoke, ok := f.interp.interpretedFunc(val[0]); ok {
+						invoke(val[1:], f.root, nil)
+					} else if deferredCall.exclusive {
+						f.interp.funcSweepMu.Lock()
+						func() {
+							defer f.interp.funcSweepMu.Unlock()
+							val[0].Call(val[1:])
+						}()
+					} else {
+						val[0].Call(val[1:])
+					}
+				}()
+			}
+		}()
 		f.mutex.Lock()
 		recovered = f.recovered
 		f.mutex.Unlock()
@@ -482,38 +500,81 @@ func runCfg(n *node, f *frame, funcNode, callNode *node) {
 }
 
 func execWithFuncSweepFence(exec bltn, f *frame) (next bltn) {
+	if f.interp.zombieDefers.Load() > 0 {
+		// A canceled worker's deferred step runs with the fence held
+		// exclusively: its interpreted writes must not overlap another
+		// execution's steps on shared containers. Interpreted panics unwind
+		// through here, so the release must be panic-safe.
+		f.interp.funcSweepMu.Lock()
+		f.interp.funcSweepExclusive.Add(1)
+		defer func() {
+			f.interp.funcSweepExclusive.Add(-1)
+			f.interp.funcSweepMu.Unlock()
+		}()
+		return exec(f)
+	}
 	f.interp.funcSweepMu.RLock()
 	defer f.interp.funcSweepMu.RUnlock()
 	return exec(f)
 }
 
 func callWithFuncSweepFenceReleased(f *frame, call func() []reflect.Value) (out []reflect.Value) {
-	f.interp.funcSweepMu.RUnlock()
-	defer f.interp.funcSweepMu.RLock()
+	exclusive := f.interp.zombieDefers.Load() > 0
+	if exclusive {
+		f.interp.funcSweepMu.Unlock()
+		defer f.interp.funcSweepMu.Lock()
+	} else {
+		f.interp.funcSweepMu.RUnlock()
+		defer f.interp.funcSweepMu.RLock()
+	}
 	return call()
 }
 
 func runWithFuncSweepFenceReleased(f *frame, run func()) {
-	f.interp.funcSweepMu.RUnlock()
-	defer f.interp.funcSweepMu.RLock()
+	exclusive := f.interp.zombieDefers.Load() > 0
+	if exclusive {
+		f.interp.funcSweepMu.Unlock()
+		defer f.interp.funcSweepMu.Lock()
+	} else {
+		f.interp.funcSweepMu.RUnlock()
+		defer f.interp.funcSweepMu.RLock()
+	}
 	run()
 }
 
 func selectWithFuncSweepFenceReleased(f *frame, cases []reflect.SelectCase) (chosen int, recv reflect.Value, recvOK bool) {
-	f.interp.funcSweepMu.RUnlock()
-	defer f.interp.funcSweepMu.RLock()
+	exclusive := f.interp.zombieDefers.Load() > 0
+	if exclusive {
+		f.interp.funcSweepMu.Unlock()
+		defer f.interp.funcSweepMu.Lock()
+	} else {
+		f.interp.funcSweepMu.RUnlock()
+		defer f.interp.funcSweepMu.RLock()
+	}
 	return reflect.Select(cases)
 }
 
 func recvWithFuncSweepFenceReleased(f *frame, channel reflect.Value) (value reflect.Value, ok bool) {
-	f.interp.funcSweepMu.RUnlock()
-	defer f.interp.funcSweepMu.RLock()
+	exclusive := f.interp.zombieDefers.Load() > 0
+	if exclusive {
+		f.interp.funcSweepMu.Unlock()
+		defer f.interp.funcSweepMu.Lock()
+	} else {
+		f.interp.funcSweepMu.RUnlock()
+		defer f.interp.funcSweepMu.RLock()
+	}
 	return channel.Recv()
 }
 
 func sendWithFuncSweepFenceReleased(f *frame, channel, value reflect.Value) {
-	f.interp.funcSweepMu.RUnlock()
-	defer f.interp.funcSweepMu.RLock()
+	exclusive := f.interp.zombieDefers.Load() > 0
+	if exclusive {
+		f.interp.funcSweepMu.Unlock()
+		defer f.interp.funcSweepMu.Lock()
+	} else {
+		f.interp.funcSweepMu.RUnlock()
+		defer f.interp.funcSweepMu.RLock()
+	}
 	channel.Send(value)
 }
 
@@ -4499,7 +4560,12 @@ func recv(n *node) {
 			destination.Set(v)
 			return
 		}
-		owner.data[i] = v
+		// The received value is an unaddressable copy; store an addressable
+		// one so later writes into the same frame cell (for example the
+		// regular-return Set) keep working.
+		nv := reflect.New(v.Type()).Elem()
+		nv.Set(v)
+		owner.data[i] = nv
 	}
 
 	if n.interp.cancelChan {

@@ -144,3 +144,85 @@ for i := 0; i < 500; i++ {
 		t.Fatalf("total after later Eval = %d, want 1503", total)
 	}
 }
+
+// TestGorneshReturnChannelReceiveInDeclaredFunc pins receive-in-return-position
+// inside a REPL-declared function: before the recv store fix, the received
+// unaddressable value was stored into the frame cell and the regular-return
+// Set panicked with "reflect: reflect.Value.Set using unaddressable value".
+func TestGorneshReturnChannelReceiveInDeclaredFunc(t *testing.T) {
+	i := interp.New(interp.Options{})
+	v, err := i.Eval("\nfunc f2() int {\n\tdone := make(chan int, 1)\n\tdone <- 7\n\treturn <-done\n}\nf2()")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := v.Interface().(int); got != 7 {
+		t.Fatalf("f2() = %d, want 7", got)
+	}
+}
+
+// TestGorneshZombieDeferredWritesDoNotRaceNewEvals pins the zombie drain
+// barrier: a canceled evaluation's deferred calls still run, but they must
+// not overlap the execution of a later evaluation on the same interpreter.
+// Before the barrier, a canceled worker unwinding defers that write a global
+// map raced the next evaluation's writes (fatal concurrent map writes).
+func TestGorneshZombieDeferredWritesDoNotRaceNewEvals(t *testing.T) {
+	i := interp.New(interp.Options{})
+	if err := i.Use(interp.Exports{"gorneshzombie/gorneshzombie": {
+		"Block": reflect.ValueOf(func() { <-make(chan struct{}) }),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := i.Eval(`
+import "gorneshzombie"
+var stressLog = map[string]int{}
+func alloc(tag string) int {
+	stressLog[tag] = len(stressLog) + 1
+	return len(stressLog)
+}
+func spin(n int) { for i := 0; i < n; i++ { _ = i } }
+func plain() {
+	defer spin(2000)
+	defer func() { alloc("plain-defer") }()
+	alloc("pre")
+	gorneshzombie.Block()
+}
+`); err != nil {
+		t.Fatal(err)
+	}
+	// A publisher keeps reading host-facing state concurrently, as embedders do.
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			func() {
+				defer func() { _ = recover() }()
+				_ = i.Globals()
+				_ = i.Symbols("main")
+			}()
+		}
+	}()
+	defer close(stop)
+
+	for k := 0; k < 40; k++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			_, err := i.EvalWithContext(ctx, "plain()")
+			done <- err
+		}()
+		time.Sleep(2 * time.Millisecond) // let the run reach the blocking host call
+		cancel()                         // API returns; worker keeps unwinding defers
+		if err := <-done; err == nil {
+			t.Fatalf("iteration %d: canceled eval returned nil error", k)
+		}
+		// The next evaluation must start while the previous worker may still
+		// be unwinding its deferred phase; the barrier serializes them.
+		if _, err := i.Eval("1 + 1"); err != nil {
+			t.Fatalf("iteration %d: follow-up eval failed: %v", k, err)
+		}
+	}
+}
