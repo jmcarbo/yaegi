@@ -61,7 +61,17 @@ func (b *callOwnerBinder) bind(v reflect.Value, hostBoundary bool) (reflect.Valu
 			return v, false
 		}
 		root, cancel := b.f.root, b.cancel
-		bound := reflect.MakeFunc(typ, func(in []reflect.Value) []reflect.Value {
+		var bound reflect.Value
+		cacheKey := boundWrapperKey{target: target, root: root, cancel: cancel, typ: typ, hostBoundary: hostBoundary}
+		if meta.group != nil {
+			b.f.interp.funcMu.RLock()
+			cached, cachedOK := meta.group.bound[cacheKey]
+			b.f.interp.funcMu.RUnlock()
+			if cachedOK {
+				return cached, true
+			}
+		}
+		bound = reflect.MakeFunc(typ, func(in []reflect.Value) []reflect.Value {
 			if hostBoundary {
 				return invokeInterpretedHostBoundary(b.f.interp, typ, meta.invoke, root, cancel, in, true)
 			}
@@ -70,6 +80,14 @@ func (b *callOwnerBinder) bind(v reflect.Value, hostBoundary bool) (reflect.Valu
 			}
 			return meta.invoke(in, root, cancel)
 		})
+		if meta.group != nil {
+			b.f.interp.funcMu.Lock()
+			if meta.group.bound == nil {
+				meta.group.bound = map[boundWrapperKey]reflect.Value{}
+			}
+			meta.group.bound[cacheKey] = bound
+			b.f.interp.funcMu.Unlock()
+		}
 		if hostBoundary {
 			b.f.interp.registerInterpretedFuncAlias(bound, meta, b.f)
 		}
@@ -233,23 +251,28 @@ func (interp *Interpreter) runOnFrame(n *node, f *frame) {
 	if n == nil {
 		return
 	}
+	// The fence is held only while the frame is being initialized: execution
+	// re-acquires it per step. Use a scoped release so a panic during setup
+	// cannot leak the read lock and wedge later sweeps.
 	interp.funcSweepMu.RLock()
-	if !f.done.Chan.IsValid() {
-		interp.mutex.RLock()
-		cancel := interp.done
-		c := reflect.ValueOf(cancel)
-		interp.mutex.RUnlock()
+	func() {
+		defer interp.funcSweepMu.RUnlock()
+		if !f.done.Chan.IsValid() {
+			interp.mutex.RLock()
+			cancel := interp.done
+			c := reflect.ValueOf(cancel)
+			interp.mutex.RUnlock()
 
-		f.mutex.Lock()
-		f.done = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: c}
-		f.cancel = cancel
-		f.mutex.Unlock()
-	}
+			f.mutex.Lock()
+			f.done = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: c}
+			f.cancel = cancel
+			f.mutex.Unlock()
+		}
 
-	for i, t := range n.types {
-		f.data[i] = reflect.New(t).Elem()
-	}
-	interp.funcSweepMu.RUnlock()
+		for i, t := range n.types {
+			f.data[i] = reflect.New(t).Elem()
+		}
+	}()
 	runCfg(n.start, f, n, nil)
 }
 
@@ -1087,6 +1110,13 @@ func snapshotAssign(n *node) {
 func snapshotCallArg(n *node) {
 	value := n.callValue
 	next := getExec(n.tnext)
+	if value == nil {
+		// cfg guarantees one snapshot node per call argument; a generator
+		// mismatch must degrade to a direct evaluation instead of calling a
+		// nil value func at runtime.
+		n.exec = func(f *frame) bltn { return next }
+		return
+	}
 	n.exec = func(f *frame) bltn {
 		v := value(f)
 		if v.IsValid() {

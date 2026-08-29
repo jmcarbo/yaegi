@@ -159,6 +159,17 @@ type interpretedFuncBuild struct {
 // canceled root.
 type interpretedFuncRebinder func(*detachedRootCloner) interpretedFuncBuild
 
+// boundWrapperKey identifies a memoized host-bound wrapper: the interpreted
+// value being bound, the activation it is bound to, and the signature the
+// native callee expects. Guarded by funcMu alongside the group's bound map.
+type boundWrapperKey struct {
+	target       reflect.Value
+	root         *frame
+	cancel       <-chan struct{}
+	typ          reflect.Type
+	hostBoundary bool
+}
+
 type interpretedFuncMeta struct {
 	invoke    interpretedFuncInvoker
 	rebind    interpretedFuncRebinder
@@ -283,13 +294,22 @@ func (interp *Interpreter) lookupInterpretedFunc(v reflect.Value) (reflect.Value
 	interp.funcMu.RLock()
 	meta, ok := interp.funcMeta[key]
 	if !ok {
+		// Convertible func types always share arity, so skip the expensive
+		// ConvertibleTo call for the common arity-mismatch candidates first.
+		keyType := key.Type()
+		keyIn, keyOut := keyType.NumIn(), keyType.NumOut()
 		for candidate, candidateMeta := range interp.funcMeta {
-			if key.Type().ConvertibleTo(candidate.Type()) {
-				converted, valid := canonicalFuncValue(key.Convert(candidate.Type()))
-				if valid && converted == candidate {
-					key, meta, ok = candidate, candidateMeta, true
-					break
-				}
+			candidateType := candidate.Type()
+			if candidateType.NumIn() != keyIn || candidateType.NumOut() != keyOut {
+				continue
+			}
+			if !keyType.ConvertibleTo(candidateType) {
+				continue
+			}
+			converted, valid := canonicalFuncValue(key.Convert(candidateType))
+			if valid && converted == candidate {
+				key, meta, ok = candidate, candidateMeta, true
+				break
 			}
 		}
 	}
@@ -475,23 +495,27 @@ type Interpreter struct {
 	// executionGate serializes live executions while allowing a canceled API
 	// call to relinquish ownership before a native call returns. A later run can
 	// then detach the canceled root without sharing its mutable cancel owner.
-	executionGate   chan struct{}
-	mutex           sync.RWMutex
-	funcMu          sync.RWMutex
-	funcSweepMu     sync.RWMutex
-	funcMeta        map[reflect.Value]interpretedFuncMeta
-	directFuncs     map[directFuncActivationKey]reflect.Value
-	ownedObjects    map[objectKey]*ownedObject
-	ownedChannels   map[uintptr]*ownedChannel
-	panicTokens     map[*ownedPanicToken]struct{}
-	frame           *frame            // program data storage during execution
-	universe        *scope            // interpreter global level scope
-	scopes          map[string]*scope // package level scopes, indexed by import path
-	srcPkg          imports           // source packages used in interpreter, indexed by path
-	publishedSrcPkg imports           // immutable symbol snapshots exposed to host readers
-	pkgNames        map[string]string // package names, indexed by import path
-	srcPkgInit      map[string]*sourcePackageInit
-	srcPkgBuild     map[string]*sourcePackageBuild
+	executionGate chan struct{}
+	mutex         sync.RWMutex
+	funcMu        sync.RWMutex
+	funcSweepMu   sync.RWMutex
+	funcMeta      map[reflect.Value]interpretedFuncMeta
+	directFuncs   map[directFuncActivationKey]reflect.Value
+	ownedObjects  map[objectKey]*ownedObject
+	ownedChannels map[uintptr]*ownedChannel
+	panicTokens   map[*ownedPanicToken]struct{}
+	// hostSharedEstimate counts owned objects currently flagged hostShared.
+	// It is maintained exactly under funcMu so the per-write ownership scans
+	// can return in constant time while no object is host-shared.
+	hostSharedEstimate int
+	frame              *frame            // program data storage during execution
+	universe           *scope            // interpreter global level scope
+	scopes             map[string]*scope // package level scopes, indexed by import path
+	srcPkg             imports           // source packages used in interpreter, indexed by path
+	publishedSrcPkg    imports           // immutable symbol snapshots exposed to host readers
+	pkgNames           map[string]string // package names, indexed by import path
+	srcPkgInit         map[string]*sourcePackageInit
+	srcPkgBuild        map[string]*sourcePackageBuild
 	// globalVarIndexes is an immutable-at-runtime snapshot of durable package
 	// variable slots. Compiler passes refresh it before releasing compileMu so
 	// canceled-worker cleanup never walks symbol maps while a later Eval mutates
@@ -781,6 +805,20 @@ func initUniverse() *scope {
 func (interp *Interpreter) resizeFrameTo(f *frame) {
 	l := len(interp.universe.types)
 	b := len(f.data)
+	// A retry after a failed source-package init rewinds the type allocator
+	// and recompiles from scratch, so it can reallocate an existing index
+	// with a different type than the cell left behind by the canceled
+	// attempt. Re-align drifted cells to the allocator before execution;
+	// cells whose type matches keep their value, which preserves globals.
+	for i := 0; i < b && i < l; i++ {
+		t := interp.universe.types[i]
+		if f.data[i].IsValid() && f.data[i].Type() == t {
+			continue
+		}
+		if t != nil {
+			f.data[i] = reflect.New(t).Elem()
+		}
+	}
 	if l-b <= 0 {
 		return
 	}
@@ -839,6 +877,11 @@ func executionIsReentrant() bool {
 
 // Eval evaluates Go code represented as a string. Eval returns the last result
 // computed by the interpreter, and a non nil error in case of failure.
+//
+// Evaluations on the same interpreter are serialized: an Eval blocked in
+// interpreted code (for example a channel receive) prevents later Evals from
+// starting until it completes. Use EvalWithContext to bound or cancel a
+// blocking evaluation.
 func (interp *Interpreter) Eval(src string) (res reflect.Value, err error) {
 	release := interp.acquireExecution()
 	defer release()

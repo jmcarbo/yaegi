@@ -3,6 +3,7 @@ package interp
 import (
 	"math"
 	"reflect"
+	"sort"
 	"unsafe"
 )
 
@@ -380,25 +381,42 @@ func ownedObjectsShareStorage(a, b *ownedObject) bool {
 }
 
 func (interp *Interpreter) markOwnedObjectHostSharedLocked(seed *ownedObject) {
-	if seed == nil {
+	if seed == nil || seed.hostShared {
 		return
 	}
 	seed.hostShared = true
-	for changed := true; changed; {
-		changed = false
+	interp.hostSharedEstimate++
+	// Propagate sharing with a worklist instead of an all-pairs fixpoint:
+	// each object transitions at most once (hostShared is sticky), so the
+	// total cost is one registry pass per newly shared object rather than
+	// repeated full scans until quiescence.
+	queue := append(make([]*ownedObject, 0, 8), seed)
+	for len(queue) > 0 {
+		obj := queue[len(queue)-1]
+		queue = queue[:len(queue)-1]
 		for _, current := range interp.ownedObjects {
 			if current.hostShared {
 				continue
 			}
-			for _, shared := range interp.ownedObjects {
-				if shared.hostShared && ownedObjectsShareStorage(current, shared) {
-					current.hostShared = true
-					changed = true
-					break
-				}
+			if ownedObjectsShareStorage(current, obj) {
+				current.hostShared = true
+				interp.hostSharedEstimate++
+				queue = append(queue, current)
 			}
 		}
 	}
+}
+
+// unregisterOwnedObjectLocked removes an object from the interpreter registry
+// while keeping the hostShared estimate exact. The caller holds funcMu.
+func (interp *Interpreter) unregisterOwnedObjectLocked(obj *ownedObject) {
+	if obj == nil {
+		return
+	}
+	if obj.hostShared {
+		interp.hostSharedEstimate--
+	}
+	delete(interp.ownedObjects, obj.key)
 }
 
 func (interp *Interpreter) publishOwnedChannelLocked(v reflect.Value) {
@@ -881,6 +899,12 @@ func (interp *Interpreter) ownedObjectsForValueLocked(v reflect.Value) []*ownedO
 }
 
 func (interp *Interpreter) ownedCellHostSharedLocked(v reflect.Value) bool {
+	// Exact count maintained by markOwnedObjectHostSharedLocked and the
+	// release paths; when it is zero no object can match below. This keeps
+	// the per-write ownership scan O(1) for pure interpreted workloads.
+	if interp.hostSharedEstimate == 0 {
+		return false
+	}
 	v = unwrapOwnedValue(v)
 	if !v.IsValid() || !v.CanAddr() {
 		return false
@@ -954,6 +978,7 @@ func (interp *Interpreter) registerNativeResultValuesFromExec(owner *frame, valu
 				if len(objects) == 0 {
 					if obj, ok := describeOwnedObject(value, owner); ok {
 						obj.hostShared = true
+						interp.hostSharedEstimate++
 						interp.ownedObjects[obj.key] = obj
 						if owner != nil {
 							if owner.ownedObjects == nil {
@@ -1036,6 +1061,12 @@ func (interp *Interpreter) markOwnedCellWriteFromExec(destination reflect.Value,
 }
 
 func (interp *Interpreter) ownedCellTouchesChannelSendLocked(destination reflect.Value) bool {
+	// Channel-send references can only exist while a channel record or a live
+	// panic token exists (both exact, funcMu-guarded registries), so skip the
+	// registry walk entirely in the common send-free case.
+	if len(interp.ownedChannels) == 0 && len(interp.panicTokens) == 0 {
+		return false
+	}
 	destination = unwrapOwnedValue(destination)
 	if !destination.IsValid() || !destination.CanAddr() {
 		return false
@@ -1055,6 +1086,12 @@ func (interp *Interpreter) ownedCellTouchesChannelSendLocked(destination reflect
 }
 
 func (interp *Interpreter) ownedWriteTouchesChannelSend(destination reflect.Value) bool {
+	// Sends and panic tokens only exist while their registries are non-empty
+	// (both exact, funcMu-guarded), so skip the destination walk entirely in
+	// the common send-free case.
+	if len(interp.ownedChannels) == 0 && len(interp.panicTokens) == 0 {
+		return false
+	}
 	interp.funcMu.RLock()
 	defer interp.funcMu.RUnlock()
 	if interp.ownedCellTouchesChannelSendLocked(destination) {
@@ -1217,6 +1254,11 @@ func (interp *Interpreter) refreshOwnedPanicTokenGraphLocked(token *ownedPanicTo
 }
 
 func (interp *Interpreter) ownedWriteNeedsHostShare(destination reflect.Value) bool {
+	// Exact count: with no host-shared objects registered, no destination can
+	// need host-share marking. Keeps the per-write check O(1).
+	if interp.hostSharedEstimate == 0 {
+		return false
+	}
 	interp.funcMu.RLock()
 	shared := interp.ownedCellHostSharedLocked(destination)
 	if !shared {
@@ -1812,9 +1854,9 @@ func (interp *Interpreter) adoptOwnedObjectLocked(owner *frame, obj *ownedObject
 		interp.transferOwnedObjectLocked(obj, owner)
 	}
 	if obj.channelRefs == 0 && !ownedObjectHasPanicToken(obj) && obj.pending.IsValid() && obj.owner != nil && obj.owner.root != owner.root {
-		for key, current := range interp.ownedObjects {
+		for _, current := range interp.ownedObjects {
 			if current == obj {
-				delete(interp.ownedObjects, key)
+				interp.unregisterOwnedObjectLocked(current)
 			}
 		}
 		delete(obj.owner.ownedObjects, obj)
@@ -2151,9 +2193,9 @@ func (interp *Interpreter) releaseOwnedObjects(f *frame, funcNode *node) {
 		}
 	}
 	deleteRecord := func(target *ownedObject) {
-		for key, obj := range interp.ownedObjects {
+		for _, obj := range interp.ownedObjects {
 			if obj == target {
-				delete(interp.ownedObjects, key)
+				interp.unregisterOwnedObjectLocked(obj)
 			}
 		}
 		delete(f.ownedObjects, target)
@@ -2161,6 +2203,30 @@ func (interp *Interpreter) releaseOwnedObjects(f *frame, funcNode *node) {
 	if len(targets) == 0 {
 		interp.funcMu.Unlock()
 		return
+	}
+
+	// Reachability is computed with one collector traversal per ownership
+	// source (ancestor frames, return cells, metadata captures) instead of
+	// one containment walk per owned object: the collector cost is
+	// independent of len(targets), which keeps frame exit O(frame+registry)
+	// rather than quadratic in the number of owned allocations.
+	type ownershipSource struct {
+		owner     *frame
+		reachable map[*ownedObject]struct{}
+		intervals *visitedIntervalCollector
+	}
+	sources := make([]ownershipSource, 0, 8)
+	collect := func(owner *frame, values []reflect.Value) {
+		if len(values) == 0 {
+			return
+		}
+		src := ownershipSource{owner: owner, reachable: map[*ownedObject]struct{}{}, intervals: &visitedIntervalCollector{}}
+		seen := map[*ownedObject]struct{}{}
+		for _, value := range values {
+			interp.collectReachableObjectsLocked(value, src.reachable, seen, src.intervals)
+		}
+		sort.Slice(src.intervals.intervals, func(i, j int) bool { return src.intervals.intervals[i].base < src.intervals.intervals[j].base })
+		sources = append(sources, src)
 	}
 
 	frames := []*frame{}
@@ -2177,19 +2243,46 @@ func (interp *Interpreter) releaseOwnedObjects(f *frame, funcNode *node) {
 	if _, seen := seenFrames[f.root]; !seen && f.root != nil {
 		frames = append(frames, f.root)
 	}
-	frameValues := make(map[*frame][]reflect.Value, len(frames))
 	frameCells := make(map[*frame][]reflect.Value, len(frames))
 	for _, frame := range frames {
-		frameValues[frame] = interp.snapshotOwnedReachabilityValues(frame)
+		collect(frame, interp.snapshotOwnedReachabilityValues(frame))
 		frameCells[frame] = snapshotFrameValues(frame)
 	}
 	returnValues := snapshotFrameValues(f)
 	if funcNode != nil && funcNode.typ != nil && len(returnValues) > len(funcNode.typ.ret) {
 		returnValues = returnValues[:len(funcNode.typ.ret)]
 	}
-	metas := make([]interpretedFuncMeta, 0, len(interp.funcMeta))
+	for _, returned := range returnValues {
+		var returnOwner *frame
+		for _, frame := range frames {
+			for _, cell := range frameCells[frame] {
+				if sameFrameCell(returned, cell) {
+					returnOwner = frame
+					break
+				}
+			}
+			if returnOwner != nil {
+				break
+			}
+		}
+		if returnOwner != nil {
+			collect(returnOwner, []reflect.Value{returned})
+		}
+	}
 	for _, meta := range interp.funcMeta {
-		metas = append(metas, meta)
+		if meta.group == nil || meta.frame == nil {
+			continue
+		}
+		captureValues := []reflect.Value{}
+		for _, capture := range meta.group.captures {
+			if capture.frame == nil || capture.frame != f && capture.frame.cloneOf != f {
+				continue
+			}
+			if capture.index >= 0 && capture.index < len(capture.frame.data) {
+				captureValues = append(captureValues, capture.frame.data[capture.index])
+			}
+		}
+		collect(meta.frame, captureValues)
 	}
 
 	for _, target := range targets {
@@ -2197,55 +2290,14 @@ func (interp *Interpreter) releaseOwnedObjects(f *frame, funcNode *node) {
 			continue
 		}
 		var owner *frame
-		for _, frame := range frames {
-			for _, value := range frameValues[frame] {
-				if interp.ownedValueContainsObjectLocked(value, target, map[*ownedObject]struct{}{}) {
-					owner = frame
-					break
-				}
-			}
-			if owner != nil {
+		for _, src := range sources {
+			if _, ok := src.reachable[target]; ok {
+				owner = src.owner
 				break
 			}
-		}
-		if owner == nil {
-			for _, returned := range returnValues {
-				if !interp.ownedValueContainsObjectLocked(returned, target, map[*ownedObject]struct{}{}) {
-					continue
-				}
-				for _, frame := range frames {
-					for _, cell := range frameCells[frame] {
-						if sameFrameCell(returned, cell) {
-							owner = frame
-							break
-						}
-					}
-					if owner != nil {
-						break
-					}
-				}
-				if owner != nil {
-					break
-				}
-			}
-		}
-		if owner == nil {
-			for _, meta := range metas {
-				if meta.group == nil {
-					continue
-				}
-				for _, capture := range meta.group.captures {
-					if capture.frame == nil || capture.frame != f && capture.frame.cloneOf != f {
-						continue
-					}
-					if capture.index >= 0 && capture.index < len(capture.frame.data) && interp.ownedValueContainsObjectLocked(capture.frame.data[capture.index], target, map[*ownedObject]struct{}{}) {
-						owner = meta.frame
-						break
-					}
-				}
-				if owner != nil {
-					break
-				}
+			if target.key.kind == reflect.Ptr && src.intervals.contains(target.key.ptr) {
+				owner = src.owner
+				break
 			}
 		}
 		if owner == nil {
@@ -2285,39 +2337,143 @@ func (interp *Interpreter) sweepRootOwnedObjects(root *frame) {
 			metas = append(metas, meta)
 		}
 	}
-	for key, target := range interp.ownedObjects {
+	// Compute reachability in one traversal instead of one containment walk
+	// per owned object: collect the objects resolvable from the durable root
+	// values, plus the address intervals of every traversed node so Ptr-kind
+	// targets reachable only as interior pointers of raw storage are kept,
+	// matching ownedValueContainsObjectLocked semantics.
+	reachableSet := map[*ownedObject]struct{}{}
+	visited := &visitedIntervalCollector{}
+	seen := map[*ownedObject]struct{}{}
+	for _, value := range values {
+		interp.collectReachableObjectsLocked(value, reachableSet, seen, visited)
+	}
+	for _, meta := range metas {
+		if meta.group == nil {
+			continue
+		}
+		for _, capture := range meta.group.captures {
+			if capture.frame == nil || capture.index < 0 || capture.index >= len(capture.frame.data) {
+				continue
+			}
+			interp.collectReachableObjectsLocked(capture.frame.data[capture.index], reachableSet, seen, visited)
+		}
+	}
+	sort.Slice(visited.intervals, func(i, j int) bool { return visited.intervals[i].base < visited.intervals[j].base })
+	for _, target := range interp.ownedObjects {
 		if target.owner == nil || target.owner.root != root || target.channelRefs > 0 || ownedObjectHasPanicToken(target) {
 			continue
 		}
-		reachable := false
-		for _, value := range values {
-			if interp.ownedValueContainsObjectLocked(value, target, map[*ownedObject]struct{}{}) {
-				reachable = true
-				break
-			}
-		}
-		if !reachable {
-			for _, meta := range metas {
-				if meta.group == nil {
-					continue
-				}
-				for _, capture := range meta.group.captures {
-					if capture.frame != nil && capture.index >= 0 && capture.index < len(capture.frame.data) &&
-						interp.ownedValueContainsObjectLocked(capture.frame.data[capture.index], target, map[*ownedObject]struct{}{}) {
-						reachable = true
-						break
-					}
-				}
-				if reachable {
-					break
-				}
-			}
-		}
-		if reachable {
+		if _, ok := reachableSet[target]; ok {
 			continue
 		}
-		delete(interp.ownedObjects, key)
+		if target.key.kind == reflect.Ptr && visited.contains(target.key.ptr) {
+			continue
+		}
+		interp.unregisterOwnedObjectLocked(target)
 		delete(target.owner.ownedObjects, target)
+	}
+}
+
+// ownedInterval is an address range of a value node visited during a
+// reachability traversal.
+type ownedInterval struct {
+	base, end uintptr
+}
+
+// visitedIntervalCollector records the address ranges of value nodes visited
+// by collectReachableObjectsLocked. Ptr-kind owned objects whose address falls
+// inside a visited range are reachable even when no registry lookup resolves
+// them, mirroring valueContainsAddress checks in the per-target walk.
+type visitedIntervalCollector struct {
+	intervals []ownedInterval
+}
+
+func (v *visitedIntervalCollector) record(value reflect.Value) {
+	if !value.IsValid() || !value.CanAddr() {
+		return
+	}
+	base := value.Addr().Pointer()
+	size := value.Type().Size()
+	end := base + size
+	if size == 0 {
+		end = base + 1
+	}
+	v.intervals = append(v.intervals, ownedInterval{base: base, end: end})
+}
+
+// contains reports whether ptr falls inside any recorded interval. The list
+// is sorted by base; find the last interval with base <= ptr and test it.
+func (v *visitedIntervalCollector) contains(ptr uintptr) bool {
+	i := sort.Search(len(v.intervals), func(i int) bool { return v.intervals[i].base > ptr })
+	if i == 0 {
+		return false
+	}
+	return ptr < v.intervals[i-1].end
+}
+
+// collectReachableObjectsLocked gathers every owned object resolvable from v
+// into reachable, and records the address interval of every visited node.
+// Traversal pruning mirrors ownedValueContainsObjectLocked: containers that
+// resolve to no owned object are not descended, hostShared objects stop the
+// descent, and already-seen objects prune revisits of identical storage.
+func (interp *Interpreter) collectReachableObjectsLocked(v reflect.Value, reachable map[*ownedObject]struct{}, seen map[*ownedObject]struct{}, visited *visitedIntervalCollector) {
+	v = unwrapOwnedValue(v)
+	if !v.IsValid() {
+		return
+	}
+	visited.record(v)
+	switch v.Kind() {
+	case reflect.Map, reflect.Ptr, reflect.Slice:
+		objects := interp.ownedObjectsForValueLocked(v)
+		if len(objects) == 0 {
+			return
+		}
+		for _, obj := range objects {
+			reachable[obj] = struct{}{}
+			if obj.hostShared {
+				return
+			}
+			if _, ok := seen[obj]; ok {
+				return
+			}
+			seen[obj] = struct{}{}
+		}
+		switch v.Kind() {
+		case reflect.Map:
+			iter := v.MapRange()
+			for iter.Next() {
+				interp.collectReachableObjectsLocked(iter.Key(), reachable, seen, visited)
+				interp.collectReachableObjectsLocked(iter.Value(), reachable, seen, visited)
+			}
+		case reflect.Ptr:
+			interp.collectReachableObjectsLocked(v.Elem(), reachable, seen, visited)
+		case reflect.Slice:
+			full := v.Slice(0, v.Cap())
+			for index := 0; index < full.Len(); index++ {
+				interp.collectReachableObjectsLocked(full.Index(index), reachable, seen, visited)
+			}
+		}
+	case reflect.UnsafePointer:
+		for _, obj := range interp.ownedObjectsForValueLocked(v) {
+			reachable[obj] = struct{}{}
+		}
+	case reflect.Struct:
+		if interp.ownedCellHostSharedLocked(v) {
+			return
+		}
+		for index := 0; index < v.NumField(); index++ {
+			if v.Field(index).CanInterface() {
+				interp.collectReachableObjectsLocked(v.Field(index), reachable, seen, visited)
+			}
+		}
+	case reflect.Array:
+		if interp.ownedCellHostSharedLocked(v) {
+			return
+		}
+		for index := 0; index < v.Len(); index++ {
+			interp.collectReachableObjectsLocked(v.Index(index), reachable, seen, visited)
+		}
 	}
 }
 
@@ -3088,7 +3244,7 @@ func (c *detachedRootCloner) commit() {
 		}
 		c.newRoot.ownedChannels[channel] = struct{}{}
 	}
-	for key, obj := range c.interp.ownedObjects {
+	for _, obj := range c.interp.ownedObjects {
 		if obj.owner != nil && obj.owner.root == c.oldRoot && !obj.hostShared && obj.channelRefs == 0 && !ownedObjectHasPanicToken(obj) {
 			capturedByOpaque := false
 			for _, meta := range c.interp.funcMeta {
@@ -3109,7 +3265,11 @@ func (c *detachedRootCloner) commit() {
 			if capturedByOpaque {
 				continue
 			}
-			delete(c.interp.ownedObjects, key)
+			for _, stale := range c.interp.ownedObjects {
+				if stale == obj {
+					c.interp.unregisterOwnedObjectLocked(stale)
+				}
+			}
 		}
 	}
 	for obj, pending := range c.pending {
@@ -3117,6 +3277,11 @@ func (c *detachedRootCloner) commit() {
 		obj.pending = pending
 	}
 	for key, obj := range c.newObjects {
+		if obj.hostShared {
+			// Clones are struct copies; keep the hostShared estimate exact
+			// for objects that inherit the flag from their source.
+			c.interp.hostSharedEstimate++
+		}
 		c.interp.ownedObjects[key] = obj
 		if c.newRoot.ownedObjects == nil {
 			c.newRoot.ownedObjects = map[*ownedObject]struct{}{}
@@ -3253,6 +3418,11 @@ func (c *detachedRootCloner) commitTargeted(owner *frame) {
 	for key, obj := range c.newObjects {
 		if existing := c.interp.ownedObjects[key]; existing != nil {
 			continue
+		}
+		if obj.hostShared {
+			// Clones are struct copies; keep the hostShared estimate exact
+			// for objects that inherit the flag from their source.
+			c.interp.hostSharedEstimate++
 		}
 		obj.owner = owner
 		c.interp.ownedObjects[key] = obj

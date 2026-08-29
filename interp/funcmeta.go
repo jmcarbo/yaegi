@@ -17,6 +17,11 @@ type funcMetaGroup struct {
 	version     uint64
 	captures    []funcMetaCapture
 	panicTokens map[*ownedPanicToken]struct{}
+	// bound memoizes host-bound MakeFunc wrappers per (target, activation,
+	// signature, boundary mode) so repeated native calls carrying the same
+	// interpreted argument reuse one wrapper instead of allocating and
+	// registering a fresh alias per call. Guarded by funcMu.
+	bound map[boundWrapperKey]reflect.Value
 }
 
 type funcMetaCapture struct {
@@ -679,7 +684,11 @@ func (interp *Interpreter) sweepRootInterpretedFuncs(root *frame, result reflect
 		runtime.Gosched()
 	}
 	if !locked {
-		interp.preservePossiblyReturnedInterpretedFuncs(result)
+		// The exclusive fence stayed contended (a worker is executing or
+		// unwinding in native code). Skip this sweep round instead of
+		// demoting every visible wrapper to opaque: opaque retention has no
+		// demotion path, so escalating here would permanently pin every
+		// wrapper and its frames. The next uncontended Eval end sweeps.
 		return
 	}
 	defer interp.funcSweepMu.Unlock()
@@ -754,28 +763,6 @@ func (interp *Interpreter) sweepRootInterpretedFuncs(root *frame, result reflect
 	}
 
 	interp.deleteUnreachableRootFuncMeta(root, candidates, liveGroups, groupVersions)
-}
-
-// preservePossiblyReturnedInterpretedFuncs is the conservative fallback when
-// another interpreted activation prevents a quiescent graph scan. Scalar
-// results cannot contain callbacks. For a function-bearing result, retain the
-// visible groups because the host may keep a wrapper after this Eval returns.
-func (interp *Interpreter) preservePossiblyReturnedInterpretedFuncs(result reflect.Value) {
-	if !result.IsValid() {
-		return
-	}
-	typ := result.Type()
-	if typ != valueInterfaceType && typ != reflect.TypeOf(reflect.Value{}) && !typeMayContainFunc(typ, map[reflect.Type]bool{}) {
-		return
-	}
-	interp.funcMu.Lock()
-	for key, meta := range interp.funcMeta {
-		if meta.retention == funcMetaVisible {
-			meta.retention = funcMetaOpaque
-			interp.funcMeta[key] = meta
-		}
-	}
-	interp.funcMu.Unlock()
 }
 
 func snapshotFuncMetaCapture(capture funcMetaCapture) (reflect.Value, bool) {

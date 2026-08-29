@@ -91,6 +91,13 @@ func (interp *Interpreter) compileSrcLocked(src, name string, inc bool) (*Progra
 func (interp *Interpreter) CompileAST(n ast.Node) (*Program, error) {
 	interp.compileMu.Lock()
 	defer interp.compileMu.Unlock()
+	// Source-package initialization adopts the ambient compileCancel as its
+	// execution owner. A reentrant CompileAST from inside a canceled run must
+	// not inherit that closed cancel, or the package-init retry would fail
+	// spuriously with context.Canceled.
+	compileCancel := interp.compileCancel
+	interp.compileCancel = nil
+	defer func() { interp.compileCancel = compileCancel }()
 	return interp.compileAST(n)
 }
 
