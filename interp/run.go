@@ -24,6 +24,11 @@ type callOwnerBinder struct {
 	bindArgs bool
 }
 
+// maxBoundWrapperCache bounds the per-group memoized host-bound wrappers;
+// activations with distinct cancel channels would otherwise accumulate one
+// entry per run on groups that survive sweeps.
+const maxBoundWrapperCache = 1024
+
 func newCallOwnerBinder(f *frame, cancel <-chan struct{}) *callOwnerBinder {
 	return &callOwnerBinder{f: f, cancel: cancel, bindArgs: true}
 }
@@ -68,6 +73,12 @@ func (b *callOwnerBinder) bind(v reflect.Value, hostBoundary bool) (reflect.Valu
 			cached, cachedOK := meta.group.bound[cacheKey]
 			b.f.interp.funcMu.RUnlock()
 			if cachedOK {
+				// A sweep may have deleted the alias while the wrapper stayed
+				// cached; registration is idempotent and restores metadata
+				// discoverability for interpreted re-entry.
+				if hostBoundary {
+					b.f.interp.registerInterpretedFuncAlias(cached, meta, b.f)
+				}
 				return cached, true
 			}
 		}
@@ -83,6 +94,12 @@ func (b *callOwnerBinder) bind(v reflect.Value, hostBoundary bool) (reflect.Valu
 		if meta.group != nil {
 			b.f.interp.funcMu.Lock()
 			if meta.group.bound == nil {
+				meta.group.bound = map[boundWrapperKey]reflect.Value{}
+			}
+			if len(meta.group.bound) >= maxBoundWrapperCache {
+				// Bound the cache: activations with distinct cancel channels
+				// would otherwise accumulate one entry per run on groups that
+				// survive sweeps.
 				meta.group.bound = map[boundWrapperKey]reflect.Value{}
 			}
 			meta.group.bound[cacheKey] = bound

@@ -381,16 +381,26 @@ func ownedObjectsShareStorage(a, b *ownedObject) bool {
 }
 
 func (interp *Interpreter) markOwnedObjectHostSharedLocked(seed *ownedObject) {
-	if seed == nil || seed.hostShared {
+	if seed == nil {
 		return
 	}
-	seed.hostShared = true
-	interp.hostSharedEstimate++
 	// Propagate sharing with a worklist instead of an all-pairs fixpoint:
 	// each object transitions at most once (hostShared is sticky), so the
 	// total cost is one registry pass per newly shared object rather than
-	// repeated full scans until quiescence.
-	queue := append(make([]*ownedObject, 0, 8), seed)
+	// repeated full scans until quiescence. Seeding from every already
+	// shared object re-closes the registry: an allocation registered after a
+	// previous marking can still share storage with it.
+	queue := make([]*ownedObject, 0, 8)
+	if !seed.hostShared {
+		seed.hostShared = true
+		interp.hostSharedEstimate++
+		queue = append(queue, seed)
+	}
+	for _, current := range interp.ownedObjects {
+		if current.hostShared {
+			queue = append(queue, current)
+		}
+	}
 	for len(queue) > 0 {
 		obj := queue[len(queue)-1]
 		queue = queue[:len(queue)-1]
@@ -1086,14 +1096,14 @@ func (interp *Interpreter) ownedCellTouchesChannelSendLocked(destination reflect
 }
 
 func (interp *Interpreter) ownedWriteTouchesChannelSend(destination reflect.Value) bool {
+	interp.funcMu.RLock()
+	defer interp.funcMu.RUnlock()
 	// Sends and panic tokens only exist while their registries are non-empty
 	// (both exact, funcMu-guarded), so skip the destination walk entirely in
-	// the common send-free case.
+	// the common send-free case. Registries are read under funcMu.
 	if len(interp.ownedChannels) == 0 && len(interp.panicTokens) == 0 {
 		return false
 	}
-	interp.funcMu.RLock()
-	defer interp.funcMu.RUnlock()
 	if interp.ownedCellTouchesChannelSendLocked(destination) {
 		return true
 	}
@@ -1254,12 +1264,14 @@ func (interp *Interpreter) refreshOwnedPanicTokenGraphLocked(token *ownedPanicTo
 }
 
 func (interp *Interpreter) ownedWriteNeedsHostShare(destination reflect.Value) bool {
+	interp.funcMu.RLock()
 	// Exact count: with no host-shared objects registered, no destination can
-	// need host-share marking. Keeps the per-write check O(1).
+	// need host-share marking. Keeps the per-write check O(1). Read under
+	// funcMu so concurrent markings on other activations are synchronized.
 	if interp.hostSharedEstimate == 0 {
+		interp.funcMu.RUnlock()
 		return false
 	}
-	interp.funcMu.RLock()
 	shared := interp.ownedCellHostSharedLocked(destination)
 	if !shared {
 		for _, obj := range interp.ownedObjectsForValueLocked(destination) {
@@ -2225,7 +2237,7 @@ func (interp *Interpreter) releaseOwnedObjects(f *frame, funcNode *node) {
 		for _, value := range values {
 			interp.collectReachableObjectsLocked(value, src.reachable, seen, src.intervals)
 		}
-		sort.Slice(src.intervals.intervals, func(i, j int) bool { return src.intervals.intervals[i].base < src.intervals.intervals[j].base })
+		src.intervals.sort()
 		sources = append(sources, src)
 	}
 
@@ -2359,7 +2371,7 @@ func (interp *Interpreter) sweepRootOwnedObjects(root *frame) {
 			interp.collectReachableObjectsLocked(capture.frame.data[capture.index], reachableSet, seen, visited)
 		}
 	}
-	sort.Slice(visited.intervals, func(i, j int) bool { return visited.intervals[i].base < visited.intervals[j].base })
+	visited.sort()
 	for _, target := range interp.ownedObjects {
 		if target.owner == nil || target.owner.root != root || target.channelRefs > 0 || ownedObjectHasPanicToken(target) {
 			continue
@@ -2387,6 +2399,7 @@ type ownedInterval struct {
 // them, mirroring valueContainsAddress checks in the per-target walk.
 type visitedIntervalCollector struct {
 	intervals []ownedInterval
+	maxEnd    []uintptr
 }
 
 func (v *visitedIntervalCollector) record(value reflect.Value) {
@@ -2400,16 +2413,36 @@ func (v *visitedIntervalCollector) record(value reflect.Value) {
 		end = base + 1
 	}
 	v.intervals = append(v.intervals, ownedInterval{base: base, end: end})
+	if n := len(v.maxEnd); n > 0 && v.maxEnd[n-1] > end {
+		v.maxEnd = append(v.maxEnd, v.maxEnd[n-1])
+	} else {
+		v.maxEnd = append(v.maxEnd, end)
+	}
+}
+
+// sort orders the intervals by base and rebuilds the prefix max-end table.
+func (v *visitedIntervalCollector) sort() {
+	sort.Slice(v.intervals, func(i, j int) bool { return v.intervals[i].base < v.intervals[j].base })
+	v.maxEnd = v.maxEnd[:0]
+	for _, interval := range v.intervals {
+		if n := len(v.maxEnd); n > 0 && v.maxEnd[n-1] > interval.end {
+			v.maxEnd = append(v.maxEnd, v.maxEnd[n-1])
+		} else {
+			v.maxEnd = append(v.maxEnd, interval.end)
+		}
+	}
 }
 
 // contains reports whether ptr falls inside any recorded interval. The list
-// is sorted by base; find the last interval with base <= ptr and test it.
+// is sorted by base; maxEnd[i] holds the largest end among intervals[0..i],
+// so among the intervals whose base is <= ptr the one ending latest is still
+// accounted for (nested and sibling intervals both covered).
 func (v *visitedIntervalCollector) contains(ptr uintptr) bool {
 	i := sort.Search(len(v.intervals), func(i int) bool { return v.intervals[i].base > ptr })
 	if i == 0 {
 		return false
 	}
-	return ptr < v.intervals[i-1].end
+	return ptr < v.maxEnd[i-1]
 }
 
 // collectReachableObjectsLocked gathers every owned object resolvable from v
