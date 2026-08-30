@@ -77,6 +77,39 @@
   entry for the convertible-type fallback. None of this is additive on top
   of the existing value-keyed map, so it lands only as a dedicated change
   with the isolation and retention suites re-derived.
+- IMPLEMENTED 2026-08-30: the weak funcval-keyed metadata registry described
+  above landed as a full keying rework. Keys are the funcval address, read
+  as the single word of a func variable (identical to the reflect.Value
+  comparison identity of the old canonical keys); every consumer moved to
+  the pointer domain — lookup, func-value walks and collectors, the purge,
+  the root sweeps, frame key lists, directFuncs source keys, the cloner's
+  snapshot maps, and the bound-wrapper cache keys. One entry exists per
+  funcval, storing its registered reflect.Type for convertible lookups,
+  which collapsed the convertible-type fallback scans into direct hits.
+  Each insertion arms a runtime.SetFinalizer that deletes the entry when
+  the wrapper becomes unreachable; a per-entry generation counter makes a
+  stale finalizer harmless when an address is reused, and arming clears any
+  leftover finalizer first because sweeps and purges may delete an entry
+  while its wrapper is still alive (the binder re-registers such aliases).
+  Implementation hazards found on the way, all load-bearing: (1) the
+  finalizer closure must capture only scalars — capturing the funcvalRef
+  struct captures the typed funcval pointer, and the finalizer itself then
+  keeps the wrapper alive forever; (2) the metadata payload pinned its own
+  wrapper through two edges — the invoker keeps the creating frame alive
+  and the frame's literal slot kept the wrapper, now reverted by restoring
+  literal slots when a frame's last runCfg activation exits (root-frame
+  slots are durable REPL storage and are never restored — restoring them
+  nils published callbacks), and the lexical clone's funcCarrier, now
+  stored as a key rather than a wrapper value; (3) arming a finalizer on a
+  funcval that was already freed fatal-errors ("pointer not in allocated
+  block"), so registration paths must hold the wrapper live until the
+  finalizer is armed, which they do on the calling stack. Retention that
+  remains is interpreter-side and master-parity: root result cells (one per
+  result-bearing call Eval — the ordinary expression-slot mechanism) and
+  package-level variables pin their wrappers, so PurgeRetainedFuncs remains
+  the manual reclamation path; the weak registry removes the registry
+  itself, its alias keys, and the bound-wrapper cache as independent
+  retainers. Isolation suites re-run green under -race.
 - Reentrancy for the execution gate is an explicit token scoped to the
   goroutine running the execution, not a native stack probe: any goroutine
   running interpreted code has runCfg on its stack, including goroutines
@@ -147,18 +180,27 @@
   Eviction is transparent: the cache is consulted
   only after a successful metadata lookup keyed by the live activation
   root, so a dropped line costs at most one extra clone.
-- Known open item (decision recorded 2026-08-30): an incremental Eval
-  beginning with `func` permanently adds 1-3 global-frame slots on this
-  branch (master adds none) because the anti-replay fix returns the wrapper
-  body, which compiles in global scope where each func literal allocates a
-  persistent slot (cfg.go funcLit pushes n.findex = sc.add(n.typ) in the
-  enclosing scope). Wrapping the body in a one-shot function literal does
-  not help: the literal's own value slot is allocated in the enclosing
-  scope before its function scope is pushed. The chosen future direction is
-  codegen for immediately-called function literals at root level (a
-  callExpr whose fun is a funcLit compiles to a direct activation without a
-  registry slot); transient slot recycling was rejected because root-frame
-  slots are reachable by goroutine-safe code paths (a `go` statement can
-  capture any slot), and the scheduler-level one-shot declaration remains
-  rejected. Severity is REPL-shaped (thousands of func-Evals on one
-  interpreter); behavior is otherwise master-compatible.
+- KNOWN OPEN ITEM RESOLVED 2026-08-30 (was: decision recorded 2026-08-30):
+  an incremental Eval beginning with `func` permanently added 1-3 global-frame
+  slots on this branch (master adds none) because the anti-replay fix returns
+  the wrapper body, which compiles in global scope where each func literal
+  allocates a persistent slot (cfg.go funcLit pushes n.findex = sc.add(n.typ)
+  in the enclosing scope). Wrapping the body in a one-shot function literal
+  does not help: the literal's own value slot is allocated in the enclosing
+  scope before its function scope is pushed. The chosen direction was
+  codegen for immediately-called function literals at root level, and that
+  is what landed: a callExpr whose function is a funcLit, compiled at global
+  frame level (sc.global, which pushBloc propagates through root-level
+  control bodies) and not under defer, now compiles to a direct activation —
+  the literal allocates no value slot (n.findex = notInFrame, n.val = n,
+  gen = nop) and the call takes the existing declared-function path of
+  run.go call (a *node fun value with an invalid rval). The funcLit's own
+  slot, the vestigial call-site sc.add, and the call-func snapshot are all
+  skipped; defer-wrapped literals keep the wrapper path. Void IIFEs now add
+  zero slots; result IIFEs add only the ordinary call-expression result
+  slot, exactly like any other root-level call (len("ab") also adds one per
+  Eval on master — that residual is the pre-existing expression-slot
+  mechanism, whose cells also pin their results and are purge-reclaimable).
+  Transient slot recycling remains rejected (root-frame slots are reachable
+  by goroutine-safe code paths), and the scheduler-level one-shot
+  declaration remains rejected.
