@@ -1034,11 +1034,6 @@ func releaseExecutionToken(interp *Interpreter) {
 	}
 }
 
-func executionIsReentrant(interp *Interpreter) bool {
-	_, ok := innermostExecutionToken(interp)
-	return ok
-}
-
 // innermostExecutionToken returns the calling goroutine's innermost token
 // for interp, if any.
 func innermostExecutionToken(interp *Interpreter) (*executionToken, bool) {

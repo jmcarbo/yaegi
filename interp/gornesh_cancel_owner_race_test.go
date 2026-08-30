@@ -41,6 +41,7 @@ func TestGorneshCanceledOwnerRewriteRace(t *testing.T) {
 // failures with t.Errorf (FailNow is only documented for the test
 // goroutine) and returns early instead of calling t.Fatal.
 func runCancelOwnerRewriteRound(t *testing.T) {
+	t.Helper()
 
 	i := interp.New(interp.Options{})
 	if err := i.Use(stdlib.Symbols); err != nil {
