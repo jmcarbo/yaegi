@@ -864,6 +864,12 @@ func (interp *Interpreter) acquireExecution() func() {
 }
 
 func (interp *Interpreter) acquireExecutionWithContext(ctx context.Context) (func(), error) {
+	// Mirror the plain gate: a host callback on the paused execution (a
+	// writer, Stringer, or conversion hook calling back with a context)
+	// must not wait for the gate its own outer evaluation holds.
+	if executionIsReentrant() {
+		return func() {}, nil
+	}
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -995,6 +1001,9 @@ func (interp *Interpreter) EvalPathWithContext(ctx context.Context, path string)
 // A non nil error is returned in case of failure.
 // The main function, test functions and benchmark functions are internally compiled but not
 // executed. Test functions can be retrieved using the Symbol() method.
+//
+// Like Eval, it is serialized with other evaluations: it waits for any
+// in-flight evaluation to complete before running package initialization.
 func (interp *Interpreter) EvalTest(path string) error {
 	// Package-level initialization runs interpreted source, so it must not
 	// overlap an in-flight evaluation: take the execution gate like Eval.

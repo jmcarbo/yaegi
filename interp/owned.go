@@ -1866,11 +1866,7 @@ func (interp *Interpreter) adoptOwnedObjectLocked(owner *frame, obj *ownedObject
 		interp.transferOwnedObjectLocked(obj, owner)
 	}
 	if obj.channelRefs == 0 && !ownedObjectHasPanicToken(obj) && obj.pending.IsValid() && obj.owner != nil && obj.owner.root != owner.root {
-		for _, current := range interp.ownedObjects {
-			if current == obj {
-				interp.unregisterOwnedObjectLocked(current)
-			}
-		}
+		interp.unregisterOwnedObjectLocked(obj)
 		delete(obj.owner.ownedObjects, obj)
 	}
 }
@@ -2204,12 +2200,11 @@ func (interp *Interpreter) releaseOwnedObjects(f *frame, funcNode *node) {
 			targets = append(targets, obj)
 		}
 	}
+	// The registry key is in the object, so removal is O(1): scanning the
+	// whole registry per target made frame exit quadratic in the number of
+	// allocations a long-lived frame had produced.
 	deleteRecord := func(target *ownedObject) {
-		for _, obj := range interp.ownedObjects {
-			if obj == target {
-				interp.unregisterOwnedObjectLocked(obj)
-			}
-		}
+		interp.unregisterOwnedObjectLocked(target)
 		delete(f.ownedObjects, target)
 	}
 	if len(targets) == 0 {
@@ -3298,11 +3293,7 @@ func (c *detachedRootCloner) commit() {
 			if capturedByOpaque {
 				continue
 			}
-			for _, stale := range c.interp.ownedObjects {
-				if stale == obj {
-					c.interp.unregisterOwnedObjectLocked(stale)
-				}
-			}
+			c.interp.unregisterOwnedObjectLocked(obj)
 		}
 	}
 	for obj, pending := range c.pending {
@@ -3366,11 +3357,7 @@ func (c *detachedRootCloner) commit() {
 			}
 			delete(obj.panicTokens, token)
 			if obj.owner != nil && obj.owner.root == c.oldRoot && !obj.hostShared && obj.channelRefs == 0 && !ownedObjectHasPanicToken(obj) {
-				for key, current := range c.interp.ownedObjects {
-					if current == obj {
-						delete(c.interp.ownedObjects, key)
-					}
-				}
+				delete(c.interp.ownedObjects, obj.key)
 				delete(obj.owner.ownedObjects, obj)
 			}
 		}

@@ -61,3 +61,30 @@
   (measured: ~255 KB per Eval across 20k sequential Evals). A host-facing
   purge API or self-describing wrapper metadata is needed before long-lived
   REPL-style interpreters are safe.
+- The context-aware gate path (EvalWithContext, EvalPathWithContext,
+  ExecuteWithContext) needs the same reentrancy bypass as the plain gate: a
+  host callback calling back with a context otherwise waits for the gate its
+  own outer evaluation holds, until the context expires (forever with
+  context.Background).
+- Reentrancy detection by stack scan has a known false positive: any goroutine
+  running interpreted code has runCfg on its stack, including goroutines
+  spawned by an interpreted `go` statement, so an Eval from a host callback on
+  such a goroutine bypasses the gate and can run concurrently with the gated
+  execution (observed as a data race between prepareExecutionFrame and the
+  running execution). The sound fix is an explicit execution/reentrancy token
+  threaded across the host-call boundary, not a stack probe.
+- Compilation entry points that can import source packages (Compile,
+  CompileAST, CompilePath, EvalTest) execute package initialization during
+  compilation and must take the execution gate like Eval, or interpreted init
+  code overlaps an in-flight evaluation.
+- Removing an owned object from the registry is O(1) via its key. Never scan
+  the registry to find an object again at deletion time: a per-target scan
+  made frame exit quadratic in the allocations of the exiting frame (a
+  100k-allocation frame spent ~15s unwinding).
+- gc resolves variable-rooted memory operands (selector, index, pointer deref)
+  of multi-assignment map destinations at assignment time, like plain
+  identifiers. Yaegi still freezes non-ident memory operands before the
+  right-hand side, so a right-hand-side call that rebinds the receiver writes
+  into the orphaned map; the same late-resolution question applies to slice
+  and pointer-deref destinations. A multi-return call RHS into a map-entry
+  destination (m[0], x = f()) also still loses the map write.

@@ -30,7 +30,13 @@ func (interp *Interpreter) FileSet() *token.FileSet {
 }
 
 // Compile parses and compiles a Go code represented as a string.
+//
+// If the source imports source packages, their initialization is executed
+// during compilation. Like Eval, compilation is serialized with other
+// evaluations on the same interpreter.
 func (interp *Interpreter) Compile(src string) (*Program, error) {
+	release := interp.acquireExecution()
+	defer release()
 	return interp.compileSrc(src, "", true)
 }
 
@@ -38,11 +44,12 @@ func (interp *Interpreter) Compile(src string) (*Program, error) {
 func (interp *Interpreter) CompilePath(path string) (*Program, error) {
 	path = filepath.ToSlash(path) // Ensure path is in Unix format. Since we work with fs.FS, we need to use Unix format.
 	if !isFile(interp.filesystem, path) {
-		// Compiling a directory imports the source package, which runs its
-		// package initialization as interpreted code: take the execution
-		// gate so it cannot overlap an in-flight evaluation. A caller that
-		// already holds the gate (Execute on a directory program) is
-		// recognized as reentrant.
+		// A directory imports the source package, which runs its package
+		// initialization as interpreted code: take the execution gate so it
+		// cannot overlap an in-flight evaluation. A caller that already
+		// holds the gate (for example a host callback of a paused
+		// evaluation) is recognized as reentrant. Only a file path yields
+		// an executable Program; a directory returns a nil Program.
 		release := interp.acquireExecution()
 		defer release()
 		_, err := interp.importSrc(mainID, path, NoTest)
@@ -53,6 +60,10 @@ func (interp *Interpreter) CompilePath(path string) (*Program, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Compiling a file can also import source packages and run their
+	// initialization, so it is serialized like the directory branch.
+	release := interp.acquireExecution()
+	defer release()
 	return interp.compileSrc(string(b), path, false)
 }
 
@@ -96,6 +107,10 @@ func (interp *Interpreter) compileSrcLocked(src, name string, inc bool) (*Progra
 // WARNING: The node must have been parsed using interp.FileSet(). Results are
 // unpredictable otherwise.
 func (interp *Interpreter) CompileAST(n ast.Node) (*Program, error) {
+	// Like Compile: gta may import source packages and run their
+	// initialization, which must not overlap an in-flight evaluation.
+	release := interp.acquireExecution()
+	defer release()
 	interp.compileMu.Lock()
 	defer interp.compileMu.Unlock()
 	// Source-package initialization adopts the ambient compileCancel as its

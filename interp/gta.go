@@ -2,6 +2,7 @@ package interp
 
 import (
 	"path"
+	"sort"
 )
 
 // gta performs a global types analysis on the AST, registering types,
@@ -267,12 +268,18 @@ func (interp *Interpreter) gta(root *node, rpath, importPath, pkgName string) ([
 				case ".":
 					dotKey := "\x00dotimport:" + ipath
 					if seenBinaryImports[dotKey] {
-						errName := ipath
+						// Report a deterministic colliding exported name, in
+						// the spirit of gc's diagnostic for re-exported names.
+						var collisions []string
 						for importedName := range pkg {
 							if _, exists := sc.sym[importedName]; exists {
-								errName = importedName
-								break
+								collisions = append(collisions, importedName)
 							}
+						}
+						errName := ipath
+						if len(collisions) > 0 {
+							sort.Strings(collisions)
+							errName = collisions[0]
 						}
 						err = n.cfgErrorf("%s redeclared in this block", errName)
 						return false

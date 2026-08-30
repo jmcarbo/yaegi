@@ -424,6 +424,10 @@ func runCfg(n *node, f *frame, funcNode, callNode *node) {
 					if invoke, ok := f.interp.interpretedFunc(val[0]); ok {
 						invoke(val[1:], f.root, nil)
 					} else if deferredCall.exclusive {
+						// Only internally generated pure-reflect deferred
+						// closures set exclusive; they cannot re-enter
+						// interpreted code or fence bookkeeping, so this
+						// bracket stays outside the capture protocol.
 						f.interp.funcSweepMu.Lock()
 						func() {
 							defer f.interp.funcSweepMu.Unlock()
@@ -532,6 +536,10 @@ func execWithFuncSweepFence(exec bltn, f *frame) (next bltn) {
 // execWithFuncSweepFence is captured in f.fenceExclusive and restored when
 // the same frame nests another acquisition (a reentrant Eval on the paused
 // execution runs its steps on the same global frame).
+//
+// Invariant: the helpers must only be called from exec-step bodies running
+// under an enclosing execWithFuncSweepFence on the same frame. A caller that
+// holds no fence would read a stale mode and unlock an unheld lock.
 
 func callWithFuncSweepFenceReleased(f *frame, call func() []reflect.Value) (out []reflect.Value) {
 	if f.fenceExclusive.Load() {
