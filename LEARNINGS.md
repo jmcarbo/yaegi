@@ -113,6 +113,16 @@
   flag) with identical results, because pointer/slice/map containers can only
   ever yield ambiguous matches; this removed the per-Eval quadratic term in
   accumulated opaque metadata.
+- The directFuncs activation cache must be swept like the ownership
+  registries: each entry pins its root frame's globals and its cloned
+  wrapper, so a long-lived interpreter otherwise grows one pinned root per
+  detached generation plus one dead line per swept-away source. The
+  incremental ownedGC sweep evicts entries whose root is no longer live
+  (durable root, active frame chain, or retained metadata) or whose source
+  and value endpoints both lost their metadata, mirroring the metadata
+  purge's endpoint rule. Eviction is transparent: the cache is consulted
+  only after a successful metadata lookup keyed by the live activation
+  root, so a dropped line costs at most one extra clone.
 - Known open item: an incremental Eval beginning with `func` permanently adds
   1-3 global-frame slots on this branch (master adds none) because the
   anti-replay fix returns the wrapper body, which compiles in global scope

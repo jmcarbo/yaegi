@@ -2418,18 +2418,18 @@ func (interp *Interpreter) sweepOwnedObjectsValuesLocked(root *frame, values []r
 	}
 }
 
-// armOwnedGCLocked bounds the ownership registries: once their combined size
-// crosses ownedGCRegistryCap, one incremental sweep is requested per
-// ownedGCAmortizeRegistrations inserts. The caller holds funcMu (every
-// registry insert site calls this from its existing critical section).
-// Arming must never take or upgrade the funcSweepMu fence: insert sites run
-// under funcMu inside fence-holding callers (e.g. publishHostValueLocked),
-// the fence is not reentrant, and upgrading while holding funcMu could fatal
-// against write-held sections. The request is consumed later, where the
-// goroutine holds no locks.
+// armOwnedGCLocked bounds the ownership registries and the directFuncs
+// activation cache: once their combined size crosses ownedGCRegistryCap, one
+// incremental sweep is requested per ownedGCAmortizeRegistrations inserts.
+// The caller holds funcMu (every registry insert site calls this from its
+// existing critical section). Arming must never take or upgrade the
+// funcSweepMu fence: insert sites run under funcMu inside fence-holding
+// callers (e.g. publishHostValueLocked), the fence is not reentrant, and
+// upgrading while holding funcMu could fatal against write-held sections. The
+// request is consumed later, where the goroutine holds no locks.
 func (interp *Interpreter) armOwnedGCLocked() {
 	interp.ownedRegistrations++
-	if len(interp.ownedObjects)+len(interp.ownedChannels) < ownedGCRegistryCap {
+	if len(interp.ownedObjects)+len(interp.ownedChannels)+len(interp.directFuncs) < ownedGCRegistryCap {
 		return
 	}
 	if interp.ownedRegistrations < ownedGCAmortizeRegistrations {
@@ -2579,6 +2579,60 @@ func (interp *Interpreter) ownedGCSweepLocked() {
 			delete(channel.owner.ownedChannels, channel)
 		}
 		channel.sends = nil
+	}
+
+	// (5) directFuncs activation cache eviction. Each entry pins its root
+	// frame (transitively the root's globals) and its cloned wrapper, so an
+	// unbounded interpreter accumulates one pinned root per detached
+	// generation and one dead line per swept-away source. An entry is
+	// evicted when its root is no longer live — not the durable root, not a
+	// root reachable from any active frame chain, and not referenced by any
+	// retained funcMeta metadata — or when neither endpoint can any longer
+	// resolve to metadata, mirroring the endpoint rule of the metadata
+	// purge. Eviction is transparent: the cache is consulted only after a
+	// successful metadata lookup keyed by the live activation root, so a
+	// dropped line costs at most one extra clone.
+	if len(interp.directFuncs) > 0 {
+		liveRoots := map[*frame]struct{}{interp.frame: {}}
+		for f := range seenFrames {
+			if f.root != nil {
+				liveRoots[f.root] = struct{}{}
+			}
+		}
+		for _, meta := range interp.funcMeta {
+			if meta.frame != nil && meta.frame.root != nil {
+				liveRoots[meta.frame.root] = struct{}{}
+			}
+			if meta.group != nil && meta.group.root != nil {
+				liveRoots[meta.group.root] = struct{}{}
+			}
+		}
+		exactKeys := make(map[reflect.Value]struct{}, len(interp.funcMeta))
+		for key := range interp.funcMeta {
+			exactKeys[key] = struct{}{}
+		}
+		for key, value := range interp.directFuncs {
+			if _, live := liveRoots[key.root]; !live {
+				delete(interp.directFuncs, key)
+				continue
+			}
+			sourceKey, ok := canonicalFuncValue(key.source)
+			if !ok {
+				delete(interp.directFuncs, key)
+				continue
+			}
+			if _, live := exactKeys[sourceKey]; live {
+				continue
+			}
+			valueKey, ok := canonicalFuncValue(value)
+			if !ok {
+				delete(interp.directFuncs, key)
+				continue
+			}
+			if _, live := exactKeys[valueKey]; !live {
+				delete(interp.directFuncs, key)
+			}
+		}
 	}
 }
 
@@ -3546,6 +3600,7 @@ func (c *detachedRootCloner) commit() {
 	for key, value := range c.directPromotions {
 		c.interp.directFuncs[key] = value
 	}
+	c.interp.armOwnedGCLocked()
 	for token := range c.interp.panicTokens {
 		if token.finished || token.pendingRoot != c.newRoot || !token.pending.IsValid() {
 			continue
@@ -3687,6 +3742,7 @@ func (c *detachedRootCloner) commitTargeted(owner *frame) {
 				c.interp.directFuncs[directFuncActivationKey{source: lineageKey.source, root: owner.root}] = clone.value
 			}
 		}
+		c.interp.armOwnedGCLocked()
 	}
 }
 
@@ -3732,6 +3788,7 @@ func (interp *Interpreter) activateDirectFuncFromExec(owner *frame, value reflec
 		cloner.commitTargeted(owner.root)
 		interp.funcMu.Lock()
 		interp.directFuncs[cacheKey] = clone
+		interp.armOwnedGCLocked()
 		interp.funcMu.Unlock()
 		activated = clone
 	})

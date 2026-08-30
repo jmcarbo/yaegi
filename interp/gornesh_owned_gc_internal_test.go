@@ -467,3 +467,74 @@ func zombiePlainGornesh() {
 		t.Fatalf("registries unbounded after zombie drains: objects=%d channels=%d", objects, channels)
 	}
 }
+
+// TestGorneshDirectFuncsCacheEvictedByOwnedGCSweep pins the directFuncs
+// activation cache bound: entries whose root is no longer live, or whose
+// source and cloned value both lost their metadata, must be evicted by the
+// incremental sweep, while a live activation (metadata reachable from the
+// durable root) survives and keeps working.
+func TestGorneshDirectFuncsCacheEvictedByOwnedGCSweep(t *testing.T) {
+	i := New(Options{})
+	if _, err := i.Eval(`
+func makeCounterDirectGornesh() func() int {
+	n := 0
+	return func() int { n++; return n }
+}
+var keptCounterDirectGornesh = makeCounterDirectGornesh()
+`); err != nil {
+		t.Fatalf("define retained counter: %v", err)
+	}
+
+	value, err := i.Eval(`keptCounterDirectGornesh`)
+	if err != nil {
+		t.Fatalf("read retained counter: %v", err)
+	}
+	keptKey, ok := canonicalFuncValue(unwrapOwnedValue(value))
+	if !ok {
+		t.Fatal("retained counter is not a func value")
+	}
+	i.funcMu.RLock()
+	_, tracked := i.funcMeta[keptKey]
+	i.funcMu.RUnlock()
+	if !tracked {
+		t.Fatal("retained counter metadata missing after eval")
+	}
+
+	deadFunc := reflect.ValueOf(func() int { return 42 })
+	deadRoot := &frame{}
+	deadRoot.root = deadRoot
+
+	liveEntry := directFuncActivationKey{source: keptKey, root: i.frame}
+	deadEndpointsEntry := directFuncActivationKey{source: deadFunc, root: i.frame}
+	deadRootEntry := directFuncActivationKey{source: keptKey, root: deadRoot}
+
+	i.funcMu.Lock()
+	i.directFuncs[liveEntry] = keptKey
+	i.directFuncs[deadEndpointsEntry] = deadFunc
+	i.directFuncs[deadRootEntry] = keptKey
+	i.funcMu.Unlock()
+
+	i.ownedGCPending.Store(true)
+	i.maybeRunOwnedGCSweep()
+
+	i.funcMu.RLock()
+	_, liveKept := i.directFuncs[liveEntry]
+	_, deadEndpointsKept := i.directFuncs[deadEndpointsEntry]
+	_, deadRootKept := i.directFuncs[deadRootEntry]
+	size := len(i.directFuncs)
+	i.funcMu.RUnlock()
+
+	if !liveKept {
+		t.Fatal("live directFuncs activation was evicted")
+	}
+	if deadEndpointsKept || deadRootKept {
+		t.Fatal("dead directFuncs entries survived the sweep")
+	}
+	if size != 1 {
+		t.Fatalf("directFuncs size after sweep: %d, want 1", size)
+	}
+
+	if _, err := i.Eval(`keptCounterDirectGornesh()`); err != nil {
+		t.Fatalf("call retained counter after sweep: %v", err)
+	}
+}
