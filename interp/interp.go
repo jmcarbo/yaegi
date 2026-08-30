@@ -1008,6 +1008,14 @@ func releaseExecutionToken(interp *Interpreter) {
 			stack.stack = stack.stack[:len(stack.stack)-1]
 		}
 	}
+	// Goroutine ids are never reused, so an empty stack means this
+	// goroutine is done with executions for good: drop the entry entirely
+	// or a long-lived embedding process leaks one map entry per goroutine
+	// that ever ran an evaluation. The entry is only ever touched by its
+	// owning goroutine, so the delete cannot race another user.
+	if len(stack.stack) == 0 {
+		executionTokens.Delete(id)
+	}
 }
 
 func executionIsReentrant(interp *Interpreter) bool {

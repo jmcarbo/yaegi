@@ -136,7 +136,10 @@
   incremental ownedGC sweep evicts entries whose root is no longer live
   (durable root, active frame chain, or retained metadata) or whose source
   and value endpoints both lost their metadata, mirroring the metadata
-  purge's endpoint rule. Eviction is transparent: the cache is consulted
+  purge's endpoint rule. In practice the root rule is a narrow safety net —
+  every detach's commit already deletes the abandoned root's entries — so
+  the endpoint rule is the workhorse reclaim for dead-source lines.
+  Eviction is transparent: the cache is consulted
   only after a successful metadata lookup keyed by the live activation
   root, so a dropped line costs at most one extra clone.
 - Known open item (decision recorded 2026-08-30): an incremental Eval
