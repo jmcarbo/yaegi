@@ -128,14 +128,26 @@ type frame struct {
 	done           reflect.SelectCase         // for cancellation of channel operations
 	cancel         <-chan struct{}            // cancellation owner for this execution; the shared root's field is rewritten by prepareExecutionFrame under mutex, so shared-root reads must take the read lock (see canceled). Every other frame's cancel is copied once by newFrame/clone under the parent's lock and frozen, so unlocked reads of f.cancel on non-root frames are race-free.
 	fenceExclusive atomic.Bool                // funcSweep fence mode captured at step acquisition
-	funcMeta       []reflect.Value            // interpreted wrappers registered by this activation
+	funcMeta       []uintptr                  // interpreted wrappers registered by this activation, as funcval keys
 	funcEscape     funcMetaRetention          // how wrappers crossed an opaque activation boundary
 	funcState      funcFrameState             // lifecycle of metadata owned by this activation
 	cloneOf        *frame                     // live activation whose lexical slots this clone shares
-	funcCarrier    reflect.Value              // wrapper whose closure keeps this lexical clone alive
+	funcCarrier    uintptr                    // funcval key of the wrapper whose closure runs this lexical clone; a key, not a value, so the clone does not pin the wrapper against the registry's weak eviction
 	funcGroup      *funcMetaGroup             // wrappers created by this activation
+	funcSlots      []funcSlotRestore          // literal slots to restore when the last activation exits
 	ownedObjects   map[*ownedObject]struct{}  // reference-backed allocations created by this activation
 	ownedChannels  map[*ownedChannel]struct{} // channels created by this activation
+}
+
+// funcSlotRestore reverts a function literal's value slot to the value it held
+// before the literal last executed. Without it, the wrapper registered in the
+// metadata registry would stay pinned by its own entry (the entry's invoker
+// keeps the creating frame alive, and the frame's slot keeps the wrapper), so
+// a dropped wrapper could never be observed unreachable by its finalizer.
+type funcSlotRestore struct {
+	owner *frame
+	index int
+	value reflect.Value
 }
 
 type deferredCall struct {
@@ -161,28 +173,36 @@ type interpretedFuncBuild struct {
 // canceled root.
 type interpretedFuncRebinder func(*detachedRootCloner) interpretedFuncBuild
 
-// boundWrapperKey identifies a memoized host-bound wrapper: the interpreted
-// value being bound, the activation it is bound to, and the signature the
-// native callee expects. Guarded by funcMu alongside the group's bound map.
+// boundWrapperKey identifies a memoized host-bound wrapper: the funcval key
+// of the interpreted value being bound, the activation it is bound to, and
+// the signature the native callee expects. Guarded by funcMu alongside the
+// group's bound map.
 type boundWrapperKey struct {
-	target       reflect.Value
+	target       uintptr
 	root         *frame
 	cancel       <-chan struct{}
 	typ          reflect.Type
 	hostBoundary bool
 }
 
+// interpretedFuncMeta is the metadata registered for one interpreted wrapper.
+// The registry is keyed by the wrapper's funcval address (see funcvalKeyOf),
+// so the entry must not retain the wrapper itself: the registered signature
+// is kept in typ for the convertible-type fallback, and the generation guard
+// makes a stale finalizer harmless if a new wrapper later reuses the address.
 type interpretedFuncMeta struct {
-	invoke    interpretedFuncInvoker
-	rebind    interpretedFuncRebinder
-	frame     *frame
-	retention funcMetaRetention
-	group     *funcMetaGroup
-	captures  []funcMetaCapture
+	invoke     interpretedFuncInvoker
+	rebind     interpretedFuncRebinder
+	frame      *frame
+	retention  funcMetaRetention
+	group      *funcMetaGroup
+	captures   []funcMetaCapture
+	typ        reflect.Type
+	generation uint64
 }
 
 type directFuncActivationKey struct {
-	source reflect.Value
+	source uintptr
 	root   *frame
 }
 
@@ -223,12 +243,12 @@ func canonicalFuncValue(v reflect.Value) (reflect.Value, bool) {
 }
 
 func (interp *Interpreter) registerInterpretedFuncWithRebinder(v reflect.Value, invoke interpretedFuncInvoker, rebind interpretedFuncRebinder, f *frame, captures []funcMetaCapture) {
-	key, ok := canonicalFuncValue(v)
+	ref, ok := funcvalRefOf(v)
 	if !ok {
 		return
 	}
 	interp.funcMu.Lock()
-	if _, exists := interp.funcMeta[key]; !exists {
+	if _, exists := interp.funcMeta[ref.key]; !exists {
 		owner := f
 		if owner != nil && owner != owner.root && owner.funcState != funcFrameActive {
 			owner = owner.root
@@ -253,22 +273,22 @@ func (interp *Interpreter) registerInterpretedFuncWithRebinder(v reflect.Value, 
 			}
 			group.version++
 		}
-		interp.funcMeta[key] = interpretedFuncMeta{invoke: invoke, rebind: rebind, frame: owner, group: group, captures: append([]funcMetaCapture(nil), captures...)}
-		if owner != nil {
-			owner.funcMeta = append(owner.funcMeta, key)
-		}
+		interp.insertFuncMetaEntryLocked(ref, interpretedFuncMeta{
+			invoke: invoke, rebind: rebind, frame: owner, group: group,
+			captures: append([]funcMetaCapture(nil), captures...), typ: v.Type(),
+		}, owner)
 	}
 	interp.funcMu.Unlock()
 }
 
 func (interp *Interpreter) registerInterpretedFuncAlias(v reflect.Value, meta interpretedFuncMeta, owner *frame) {
-	key, ok := canonicalFuncValue(v)
+	ref, ok := funcvalRefOf(v)
 	if !ok || owner == nil {
 		return
 	}
 	interp.funcMu.Lock()
 	defer interp.funcMu.Unlock()
-	if _, exists := interp.funcMeta[key]; exists {
+	if _, exists := interp.funcMeta[ref.key]; exists {
 		return
 	}
 	// The bound wrapper itself keeps the exact invocation owner alive. Metadata
@@ -279,8 +299,7 @@ func (interp *Interpreter) registerInterpretedFuncAlias(v reflect.Value, meta in
 	if meta.group != nil {
 		meta.group.root = owner.root
 	}
-	interp.funcMeta[key] = meta
-	owner.root.funcMeta = append(owner.root.funcMeta, key)
+	interp.insertFuncMetaEntryLocked(ref, meta, owner.root)
 }
 
 func (interp *Interpreter) interpretedFunc(v reflect.Value) (interpretedFuncInvoker, bool) {
@@ -288,33 +307,18 @@ func (interp *Interpreter) interpretedFunc(v reflect.Value) (interpretedFuncInvo
 	return meta.invoke, ok
 }
 
-func (interp *Interpreter) lookupInterpretedFunc(v reflect.Value) (reflect.Value, interpretedFuncMeta, bool) {
-	key, ok := canonicalFuncValue(v)
+// lookupInterpretedFunc resolves the metadata registered for the wrapper v.
+// The registry is keyed by v's funcval address, so a direct hit covers both
+// the exact registered type and any convertible named type over the same
+// funcval: a funcval is always created under one concrete signature, and func
+// conversions between identical underlying types preserve the funcval.
+func (interp *Interpreter) lookupInterpretedFunc(v reflect.Value) (uintptr, interpretedFuncMeta, bool) {
+	key, ok := funcvalKeyOf(v)
 	if !ok {
-		return reflect.Value{}, interpretedFuncMeta{}, false
+		return 0, interpretedFuncMeta{}, false
 	}
 	interp.funcMu.RLock()
 	meta, ok := interp.funcMeta[key]
-	if !ok {
-		// Convertible func types always share arity, so skip the expensive
-		// ConvertibleTo call for the common arity-mismatch candidates first.
-		keyType := key.Type()
-		keyIn, keyOut := keyType.NumIn(), keyType.NumOut()
-		for candidate, candidateMeta := range interp.funcMeta {
-			candidateType := candidate.Type()
-			if candidateType.NumIn() != keyIn || candidateType.NumOut() != keyOut {
-				continue
-			}
-			if !keyType.ConvertibleTo(candidateType) {
-				continue
-			}
-			converted, valid := canonicalFuncValue(key.Convert(candidateType))
-			if valid && converted == candidate {
-				key, meta, ok = candidate, candidateMeta, true
-				break
-			}
-		}
-	}
 	interp.funcMu.RUnlock()
 	return key, meta, ok
 }
@@ -552,11 +556,16 @@ type Interpreter struct {
 	// sweep holding the fence reads it exactly: a draining frame's remaining
 	// deferred call values are invisible to the sweep's root set, so the
 	// incremental sweep must not run concurrently with any drain.
-	frameDrains   atomic.Int64
-	mutex         sync.RWMutex
-	funcMu        sync.RWMutex
-	funcSweepMu   sync.RWMutex
-	funcMeta      map[reflect.Value]interpretedFuncMeta
+	frameDrains atomic.Int64
+	mutex       sync.RWMutex
+	funcMu      sync.RWMutex
+	funcSweepMu sync.RWMutex
+	// funcMeta is keyed by the funcval address of each registered interpreted
+	// wrapper (see funcvalKeyOf). The key is a plain integer, so the registry
+	// does not retain the wrapper: when the host drops the last reference, a
+	// finalizer armed at insertion deletes the entry (guarded by the entry's
+	// generation against funcval address reuse).
+	funcMeta      map[uintptr]interpretedFuncMeta
 	directFuncs   map[directFuncActivationKey]reflect.Value
 	ownedObjects  map[objectKey]*ownedObject
 	ownedChannels map[uintptr]*ownedChannel
@@ -728,7 +737,7 @@ func New(options Options) *Interpreter {
 		executionGate:    make(chan struct{}, 1),
 		hooks:            &hooks{},
 		generic:          map[string]*node{},
-		funcMeta:         map[reflect.Value]interpretedFuncMeta{},
+		funcMeta:         map[uintptr]interpretedFuncMeta{},
 		directFuncs:      map[directFuncActivationKey]reflect.Value{},
 		ownedObjects:     map[objectKey]*ownedObject{},
 		ownedChannels:    map[uintptr]*ownedChannel{},

@@ -448,7 +448,11 @@ func (interp *Interpreter) publishOwnedChannelLocked(v reflect.Value) {
 			continue
 		}
 		interp.refreshOwnedChannelSendLocked(send)
-		for key := range send.funcs {
+		for value := range send.funcs {
+			key, ok := funcvalKeyOf(value)
+			if !ok {
+				continue
+			}
 			meta, ok := interp.funcMeta[key]
 			if !ok {
 				continue
@@ -636,18 +640,7 @@ func (interp *Interpreter) collectOwnedChannelGraphLocked(v reflect.Value, objec
 		if !ok {
 			return
 		}
-		meta, exists := interp.funcMeta[key]
-		if !exists {
-			for candidate, candidateMeta := range interp.funcMeta {
-				if key.Type().ConvertibleTo(candidate.Type()) {
-					converted, valid := canonicalFuncValue(key.Convert(candidate.Type()))
-					if valid && converted == candidate {
-						key, meta, exists = candidate, candidateMeta, true
-						break
-					}
-				}
-			}
-		}
+		meta, exists := interp.funcMeta[funcvalKey(key)]
 		if !exists {
 			return
 		}
@@ -735,7 +728,11 @@ func (interp *Interpreter) attachOwnedChannelSendMembershipsLocked(send *ownedCh
 			obj.channelRefs++
 		}
 	}
-	for key := range send.funcs {
+	for value := range send.funcs {
+		key, ok := funcvalKeyOf(value)
+		if !ok {
+			continue
+		}
 		meta, exists := interp.funcMeta[key]
 		if !exists || meta.group == nil {
 			continue
@@ -787,7 +784,11 @@ func (interp *Interpreter) replaceOwnedChannelSendGraphLocked(send *ownedChannel
 		otherObjects, otherFuncs, otherGroups = send.objects, send.funcs, send.groups
 	}
 	groups := map[*funcMetaGroup]struct{}{}
-	for key := range funcs {
+	for value := range funcs {
+		key, ok := funcvalKeyOf(value)
+		if !ok {
+			continue
+		}
 		meta, exists := interp.funcMeta[key]
 		if !exists || meta.group == nil {
 			continue
@@ -1640,7 +1641,11 @@ func (interp *Interpreter) attachOwnedPanicTokenMembershipsLocked(token *ownedPa
 		}
 		obj.panicTokens[token] = struct{}{}
 	}
-	for key := range funcs {
+	for value := range funcs {
+		key, ok := funcvalKeyOf(value)
+		if !ok {
+			continue
+		}
 		meta, ok := interp.funcMeta[key]
 		if !ok || meta.group == nil {
 			continue
@@ -2101,7 +2106,7 @@ func (interp *Interpreter) ownedValuesContainChannelThroughFuncsLocked(values []
 			if _, seen := seenGroups[meta.group]; seen {
 				continue
 			}
-			visitor := funcValueVisitor{targets: map[reflect.Value]struct{}{key: {}}}
+			visitor := funcValueVisitor{targets: map[uintptr]struct{}{key: {}}}
 			matched := false
 			for _, value := range values {
 				if visitor.contains(value) {
@@ -2607,7 +2612,7 @@ func (interp *Interpreter) ownedGCSweepLocked() {
 				liveRoots[meta.group.root] = struct{}{}
 			}
 		}
-		exactKeys := make(map[reflect.Value]struct{}, len(interp.funcMeta))
+		exactKeys := make(map[uintptr]struct{}, len(interp.funcMeta))
 		for key := range interp.funcMeta {
 			exactKeys[key] = struct{}{}
 		}
@@ -2616,15 +2621,10 @@ func (interp *Interpreter) ownedGCSweepLocked() {
 				delete(interp.directFuncs, key)
 				continue
 			}
-			sourceKey, ok := canonicalFuncValue(key.source)
-			if !ok {
-				delete(interp.directFuncs, key)
+			if _, live := exactKeys[key.source]; live {
 				continue
 			}
-			if _, live := exactKeys[sourceKey]; live {
-				continue
-			}
-			valueKey, ok := canonicalFuncValue(value)
+			valueKey, ok := funcvalKeyOf(value)
 			if !ok {
 				delete(interp.directFuncs, key)
 				continue
@@ -2777,7 +2777,7 @@ type ownedCellKey struct {
 }
 
 type detachedFuncClone struct {
-	oldKey reflect.Value
+	oldKey uintptr
 	value  reflect.Value
 	meta   interpretedFuncMeta
 }
@@ -2792,12 +2792,12 @@ type detachedRootCloner struct {
 	objectSet        map[*ownedObject]struct{}
 	objectMemo       map[*ownedObject]reflect.Value
 	cells            map[ownedCellKey]reflect.Value
-	funcMeta         map[reflect.Value]interpretedFuncMeta
-	funcMemo         map[reflect.Value]reflect.Value
-	funcBuilding     map[reflect.Value]bool
+	funcMeta         map[uintptr]interpretedFuncMeta
+	funcMemo         map[uintptr]reflect.Value
+	funcBuilding     map[uintptr]bool
 	frameMemo        map[*frame]*frame
 	groupMemo        map[*funcMetaGroup]*funcMetaGroup
-	funcRepairs      map[reflect.Value][]reflect.Value
+	funcRepairs      map[uintptr][]reflect.Value
 	funcClones       []detachedFuncClone
 	newObjects       map[objectKey]*ownedObject
 	pending          map[*ownedObject]reflect.Value
@@ -2811,10 +2811,10 @@ func newDetachedRootCloner(interp *Interpreter, oldRoot, newRoot *frame, cancel 
 		interp: interp, oldRoot: oldRoot, newRoot: newRoot, cancel: cancel,
 		objects: map[objectKey]*ownedObject{}, objectSet: map[*ownedObject]struct{}{},
 		objectMemo: map[*ownedObject]reflect.Value{}, cells: map[ownedCellKey]reflect.Value{},
-		funcMeta: map[reflect.Value]interpretedFuncMeta{}, funcMemo: map[reflect.Value]reflect.Value{},
-		funcBuilding: map[reflect.Value]bool{}, frameMemo: map[*frame]*frame{},
+		funcMeta: map[uintptr]interpretedFuncMeta{}, funcMemo: map[uintptr]reflect.Value{},
+		funcBuilding: map[uintptr]bool{}, frameMemo: map[*frame]*frame{},
 		groupMemo:        map[*funcMetaGroup]*funcMetaGroup{},
-		funcRepairs:      map[reflect.Value][]reflect.Value{},
+		funcRepairs:      map[uintptr][]reflect.Value{},
 		newObjects:       map[objectKey]*ownedObject{},
 		pending:          map[*ownedObject]reflect.Value{},
 		directLineage:    map[directFuncActivationKey]reflect.Value{},
@@ -2840,12 +2840,12 @@ func newDetachedRootCloner(interp *Interpreter, oldRoot, newRoot *frame, cancel 
 func (c *detachedRootCloner) cloneDirectFuncLineage() {
 	for key, active := range c.directLineage {
 		clone := c.cloneFunc(active)
-		if clone.IsValid() && !sameCanonicalFuncValue(clone, active) {
+		if clone.IsValid() && !sameFuncvalKey(clone, active) {
 			c.directPromotions[directFuncActivationKey{source: key.source, root: c.newRoot}] = clone
-			if activeKey, ok := canonicalFuncValue(active); ok {
+			if activeKey, ok := funcvalKeyOf(active); ok {
 				c.directPromotions[directFuncActivationKey{source: activeKey, root: c.newRoot}] = clone
 			}
-			if cloneKey, ok := canonicalFuncValue(clone); ok {
+			if cloneKey, ok := funcvalKeyOf(clone); ok {
 				c.directPromotions[directFuncActivationKey{source: cloneKey, root: c.newRoot}] = clone
 			}
 		}
@@ -3315,7 +3315,7 @@ func (c *detachedRootCloner) cloneUnsafePointer(v reflect.Value) reflect.Value {
 }
 
 func (c *detachedRootCloner) cloneFunc(v reflect.Value) reflect.Value {
-	key, ok := canonicalFuncValue(v)
+	key, ok := funcvalKeyOf(v)
 	if !ok {
 		return v
 	}
@@ -3371,7 +3371,7 @@ func (c *detachedRootCloner) cloneFunc(v reflect.Value) reflect.Value {
 	return cloned
 }
 
-func directFuncKey(v reflect.Value) (reflect.Value, bool) {
+func directFuncKey(v reflect.Value) (uintptr, bool) {
 	for v.IsValid() {
 		if v.Type() == valueInterfaceType && v.CanInterface() {
 			v = v.Interface().(valueInterface).value
@@ -3379,14 +3379,14 @@ func directFuncKey(v reflect.Value) (reflect.Value, bool) {
 		}
 		if v.Kind() == reflect.Interface {
 			if v.IsNil() {
-				return reflect.Value{}, false
+				return 0, false
 			}
 			v = v.Elem()
 			continue
 		}
 		break
 	}
-	return canonicalFuncValue(v)
+	return funcvalKeyOf(v)
 }
 
 func setClonedDirectFunc(dest, cloned reflect.Value) {
@@ -3580,7 +3580,7 @@ func (c *detachedRootCloner) commit() {
 		c.newRoot.ownedObjects[obj] = struct{}{}
 	}
 	for _, clone := range c.funcClones {
-		newKey, ok := canonicalFuncValue(clone.value)
+		newRef, ok := funcvalRefOf(clone.value)
 		if !ok {
 			continue
 		}
@@ -3591,8 +3591,7 @@ func (c *detachedRootCloner) commit() {
 		meta := clone.meta
 		meta.frame = c.newRoot
 		meta.group = group
-		c.interp.funcMeta[newKey] = meta
-		c.newRoot.funcMeta = append(c.newRoot.funcMeta, newKey)
+		c.interp.insertFuncMetaEntryLocked(newRef, meta, c.newRoot)
 		if clone.meta.retention == funcMetaVisible {
 			delete(c.interp.funcMeta, clone.oldKey)
 		}
@@ -3639,11 +3638,15 @@ func (c *detachedRootCloner) commit() {
 			delete(group.panicTokens, token)
 			c.interp.releaseOwnedPanicGroupLocked(group)
 		}
-		for key := range oldFuncs {
-			if _, raw := token.funcs[key]; raw {
+		for value := range oldFuncs {
+			if _, raw := token.funcs[value]; raw {
 				continue
 			}
-			if _, current := funcs[key]; current {
+			if _, current := funcs[value]; current {
+				continue
+			}
+			key, ok := funcvalKeyOf(value)
+			if !ok {
 				continue
 			}
 			meta, ok := c.interp.funcMeta[key]
@@ -3666,16 +3669,24 @@ func (c *detachedRootCloner) commit() {
 			// The cloned wrapper can be present in the pending aggregate before
 			// its canonical metadata is discoverable through graph traversal.
 			// Carry the exact old->new wrapper mapping produced by cloneFunc.
-			for oldKey := range send.pendingFuncs {
+			for value := range send.pendingFuncs {
+				oldKey, ok := funcvalKeyOf(value)
+				if !ok {
+					continue
+				}
 				clone, ok := c.funcMemo[oldKey]
 				if !ok {
 					continue
 				}
-				if newKey, valid := canonicalFuncValue(clone); valid {
-					funcs[newKey] = struct{}{}
+				if _, valid := funcvalKeyOf(clone); valid {
+					funcs[reflect.ValueOf(clone.Interface())] = struct{}{}
 				}
 			}
-			for key := range funcs {
+			for value := range funcs {
+				key, ok := funcvalKeyOf(value)
+				if !ok {
+					continue
+				}
 				meta, exists := c.interp.funcMeta[key]
 				if !exists {
 					continue
@@ -3721,7 +3732,7 @@ func (c *detachedRootCloner) commitTargeted(owner *frame) {
 		owner.ownedObjects[obj] = struct{}{}
 	}
 	for _, clone := range c.funcClones {
-		newKey, ok := canonicalFuncValue(clone.value)
+		newRef, ok := funcvalRefOf(clone.value)
 		if !ok {
 			continue
 		}
@@ -3733,12 +3744,11 @@ func (c *detachedRootCloner) commitTargeted(owner *frame) {
 		} else {
 			meta.group.root = owner.root
 		}
-		c.interp.funcMeta[newKey] = meta
-		owner.funcMeta = append(owner.funcMeta, newKey)
+		c.interp.insertFuncMetaEntryLocked(newRef, meta, owner)
 		c.interp.directFuncs[directFuncActivationKey{source: clone.oldKey, root: owner.root}] = clone.value
-		c.interp.directFuncs[directFuncActivationKey{source: newKey, root: owner.root}] = clone.value
+		c.interp.directFuncs[directFuncActivationKey{source: newRef.key, root: owner.root}] = clone.value
 		for lineageKey, active := range c.directLineage {
-			if sameCanonicalFuncValue(active, clone.oldKey) {
+			if activeKey, ok := funcvalKeyOf(active); ok && activeKey == clone.oldKey {
 				c.interp.directFuncs[directFuncActivationKey{source: lineageKey.source, root: owner.root}] = clone.value
 			}
 		}
@@ -3778,8 +3788,8 @@ func (interp *Interpreter) activateDirectFuncFromExec(owner *frame, value reflec
 			return
 		}
 		cloner := newDetachedRootCloner(interp, oldRoot, owner.root, cancel)
-		clone := cloner.cloneFunc(source)
-		if !clone.IsValid() || sameCanonicalFuncValue(clone, value) {
+		clone := cloner.cloneFunc(value)
+		if !clone.IsValid() || sameFuncvalKey(clone, value) {
 			return
 		}
 		if clone.Type() != value.Type() && clone.Type().ConvertibleTo(value.Type()) {
@@ -3793,10 +3803,4 @@ func (interp *Interpreter) activateDirectFuncFromExec(owner *frame, value reflec
 		activated = clone
 	})
 	return activated
-}
-
-func sameCanonicalFuncValue(left, right reflect.Value) bool {
-	leftKey, leftOK := canonicalFuncValue(left)
-	rightKey, rightOK := canonicalFuncValue(right)
-	return leftOK && rightOK && leftKey == rightKey
 }

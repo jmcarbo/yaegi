@@ -247,7 +247,7 @@ counterGornesh := makeCounterGornesh()
 	if err != nil {
 		t.Fatalf("read counter closure: %v", err)
 	}
-	key, ok := canonicalFuncValue(unwrapOwnedValue(res))
+	key, ok := funcvalKeyOf(unwrapOwnedValue(res))
 	if !ok {
 		t.Fatal("counter closure has no canonical func value")
 	}
@@ -489,7 +489,7 @@ var keptCounterDirectGornesh = makeCounterDirectGornesh()
 	if err != nil {
 		t.Fatalf("read retained counter: %v", err)
 	}
-	keptKey, ok := canonicalFuncValue(unwrapOwnedValue(value))
+	keptKey, ok := funcvalKeyOf(unwrapOwnedValue(value))
 	if !ok {
 		t.Fatal("retained counter is not a func value")
 	}
@@ -501,17 +501,21 @@ var keptCounterDirectGornesh = makeCounterDirectGornesh()
 	}
 
 	deadFunc := reflect.ValueOf(func() int { return 42 })
+	deadKey, ok := funcvalKeyOf(deadFunc)
+	if !ok {
+		t.Fatal("dead func is not a func value")
+	}
 	deadRoot := &frame{}
 	deadRoot.root = deadRoot
 
 	liveEntry := directFuncActivationKey{source: keptKey, root: i.frame}
-	deadEndpointsEntry := directFuncActivationKey{source: deadFunc, root: i.frame}
+	deadEndpointsEntry := directFuncActivationKey{source: deadKey, root: i.frame}
 	deadRootEntry := directFuncActivationKey{source: keptKey, root: deadRoot}
 
 	i.funcMu.Lock()
-	i.directFuncs[liveEntry] = keptKey
+	i.directFuncs[liveEntry] = value
 	i.directFuncs[deadEndpointsEntry] = deadFunc
-	i.directFuncs[deadRootEntry] = keptKey
+	i.directFuncs[deadRootEntry] = value
 	i.funcMu.Unlock()
 
 	i.ownedGCPending.Store(true)

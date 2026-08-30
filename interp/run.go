@@ -61,13 +61,13 @@ func (b *callOwnerBinder) bind(v reflect.Value, hostBoundary bool) (reflect.Valu
 		target := reflect.ValueOf(v.Interface())
 		target = b.f.interp.activateDirectFuncFromExec(b.f, target, b.cancel)
 		typ := v.Type()
-		_, meta, interpreted := b.f.interp.lookupInterpretedFunc(target)
+		targetKey, meta, interpreted := b.f.interp.lookupInterpretedFunc(target)
 		if !interpreted {
 			return v, false
 		}
 		root, cancel := b.f.root, b.cancel
 		var bound reflect.Value
-		cacheKey := boundWrapperKey{target: target, root: root, cancel: cancel, typ: typ, hostBoundary: hostBoundary}
+		cacheKey := boundWrapperKey{target: targetKey, root: root, cancel: cancel, typ: typ, hostBoundary: hostBoundary}
 		if meta.group != nil {
 			b.f.interp.funcMu.RLock()
 			cached, cachedOK := meta.group.bound[cacheKey]
@@ -157,7 +157,7 @@ func activateDirectFuncValueFromExec(f *frame, value reflect.Value) reflect.Valu
 			return value
 		}
 		active := activateDirectFuncValueFromExec(f, value.Elem())
-		if sameCanonicalFuncValue(active, value.Elem()) {
+		if sameFuncvalKey(active, value.Elem()) {
 			return value
 		}
 		out := reflect.New(value.Type()).Elem()
@@ -484,6 +484,15 @@ func runCfg(n *node, f *frame, funcNode, callNode *node) {
 		f.mutex.Lock()
 		recovered = f.recovered
 		f.mutex.Unlock()
+		// Revert the function literal slots only when the last activation on
+		// this frame exits: a reentrant activation nested on the same frame
+		// must not clobber slots the outer execution still reads.
+		f.interp.funcMu.Lock()
+		lastActivation := f.interp.activeFrames[f] <= 1
+		f.interp.funcMu.Unlock()
+		if lastActivation {
+			applyFuncSlotRestores(f)
+		}
 		// Deregister the activation only AFTER the full release sequence and
 		// BEFORE the repanic: while this frame's deferred calls drain —
 		// including a canceled worker's zombie phase, whose interpreted
@@ -2700,15 +2709,51 @@ func getFunc(n *node) {
 		build := buildClosureWrapper(n, fr, slotOwner, i, o, f.root, f.cancel, captureRefs)
 		fct := build.value
 		n.interp.registerInterpretedFuncWithRebinder(fct, build.invoke, build.rebind, f, build.captures)
-		n.interp.funcMu.Lock()
-		fr.funcCarrier, _ = canonicalFuncValue(fct)
-		n.interp.funcMu.Unlock()
+		if ref, ok := funcvalRefOf(fct); ok {
+			n.interp.funcMu.Lock()
+			fr.funcCarrier = ref.key
+			n.interp.funcMu.Unlock()
+		}
 
 		f.mutex.Lock()
 		slotOwner.data[i] = fct
+		// Keep the slot's pre-execution value for the exit-time restore, so a
+		// finished frame does not pin the wrapper in its slot. Root-frame slots
+		// are durable REPL storage, never restored.
+		if slotOwner != slotOwner.root {
+			recordFuncSlotRestoreLocked(f, slotOwner, i, o)
+		}
 		f.mutex.Unlock()
 
 		return next
+	}
+}
+
+// recordFuncSlotRestoreLocked remembers the restore for a literal slot, once
+// per (slot, frame): later executions of the same literal overwrite the slot
+// but must not displace the original restore value. The caller holds f.mutex.
+func recordFuncSlotRestoreLocked(f, slotOwner *frame, index int, value reflect.Value) {
+	for _, existing := range f.funcSlots {
+		if existing.owner == slotOwner && existing.index == index {
+			return
+		}
+	}
+	f.funcSlots = append(f.funcSlots, funcSlotRestore{owner: slotOwner, index: index, value: value})
+}
+
+// applyFuncSlotRestores reverts every literal slot recorded by this frame. It
+// runs when the frame's last runCfg activation exits: the frame is done
+// executing, so its slots must no longer pin wrappers against the registry's
+// weak eviction.
+func applyFuncSlotRestores(f *frame) {
+	f.mutex.Lock()
+	restores := f.funcSlots
+	f.funcSlots = nil
+	f.mutex.Unlock()
+	for _, restore := range restores {
+		restore.owner.mutex.Lock()
+		restore.owner.data[restore.index] = restore.value
+		restore.owner.mutex.Unlock()
 	}
 }
 
@@ -2769,7 +2814,7 @@ func buildClosureWrapper(n *node, captured, slotOwner *frame, slotIndex int, res
 			clonedRestore = c.cloneValue(restore, true)
 		}
 		build := buildClosureWrapper(n, clonedCaptured, clonedSlotOwner, slotIndex, clonedRestore, c.newRoot, c.cancel, captureRefs)
-		clonedCaptured.funcCarrier, _ = canonicalFuncValue(build.value)
+		clonedCaptured.funcCarrier, _ = funcvalKeyOf(build.value)
 		return build
 	}
 	return interpretedFuncBuild{

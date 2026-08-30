@@ -41,8 +41,8 @@ func cancelBlockedFuncMetaEvalGornesh(t *testing.T, i *Interpreter, source strin
 func TestGorneshInterpretedFuncMetadataRootSweepKeepsPostSnapshotRegistration(t *testing.T) {
 	i := New(Options{})
 	root := i.frame
-	oldKey, _ := canonicalFuncValue(reflect.ValueOf(func() {}))
-	newKey, _ := canonicalFuncValue(reflect.ValueOf(func() {}))
+	oldKey, _ := funcvalKeyOf(reflect.ValueOf(func() {}))
+	newKey, _ := funcvalKeyOf(reflect.ValueOf(func() {}))
 	oldGroup := &funcMetaGroup{root: root, version: 1}
 	newGroup := &funcMetaGroup{root: root, version: 1}
 	oldMeta := interpretedFuncMeta{frame: root, group: oldGroup}
@@ -57,7 +57,7 @@ func TestGorneshInterpretedFuncMetadataRootSweepKeepsPostSnapshotRegistration(t 
 	// The new entry represents a root-visible wrapper registered after the
 	// sweep candidate snapshot. Only the snapshotted old entry may be removed.
 	i.deleteUnreachableRootFuncMeta(root,
-		map[reflect.Value]interpretedFuncMeta{oldKey: oldMeta},
+		map[uintptr]interpretedFuncMeta{oldKey: oldMeta},
 		map[*funcMetaGroup]struct{}{},
 		map[*funcMetaGroup]uint64{oldGroup: oldGroup.version})
 
@@ -985,7 +985,7 @@ func TestGorneshEscapeTokenUsesExactFunctionCaptures(t *testing.T) {
 	frame.data[0] = captured
 	group := &funcMetaGroup{root: root, captures: []funcMetaCapture{{frame: frame, index: 0}}}
 	wrapper := reflect.ValueOf(func() {})
-	key, _ := canonicalFuncValue(wrapper)
+	key, _ := funcvalKeyOf(wrapper)
 	i.funcMu.Lock()
 	i.funcMeta[key] = interpretedFuncMeta{frame: root, group: group, captures: nil}
 	objects := map[*ownedObject]struct{}{}
@@ -1013,7 +1013,7 @@ func TestGorneshEscapeTokenDoesNotReadHostSharedCaptureCell(t *testing.T) {
 	}
 
 	wrapper := reflect.ValueOf(func() {})
-	key, _ := canonicalFuncValue(wrapper)
+	key, _ := funcvalKeyOf(wrapper)
 	i.funcMu.Lock()
 	i.funcMeta[key] = interpretedFuncMeta{frame: root, group: &funcMetaGroup{root: root}, captures: []funcMetaCapture{{frame: frame, index: 0}}}
 	i.funcMu.Unlock()
@@ -1235,11 +1235,13 @@ publishPendingChannelGornesh <- publishPendingPayloadGornesh
 		t.Fatalf("activate detached pending channel: %v", err)
 	}
 	i.funcMu.RLock()
-	pendingKeys := map[reflect.Value]struct{}{}
+	pendingKeys := map[uintptr]struct{}{}
 	for _, channel := range i.ownedChannels {
 		for _, send := range channel.sends {
-			for key := range send.pendingFuncs {
-				pendingKeys[key] = struct{}{}
+			for value := range send.pendingFuncs {
+				if key, ok := funcvalKeyOf(value); ok {
+					pendingKeys[key] = struct{}{}
+				}
 			}
 		}
 	}
