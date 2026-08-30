@@ -2,6 +2,7 @@ package interp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -900,11 +901,11 @@ func (interp *Interpreter) acquireExecution() func() {
 	case <-interp.executionGate:
 		return func() { interp.executionGate <- struct{}{} }
 	default:
-		if executionIsReentrant() {
+		if executionIsReentrant(interp) {
 			// Writers, Stringers, and conversion hooks may synchronously call
-			// back into the same interpreter. The outer runCfg frame proves this
-			// call is on that paused execution stack rather than an unrelated
-			// goroutine, so it can inherit the active root and cancel owner.
+			// back into the same interpreter. This goroutine is running the
+			// paused execution (it carries its reentrancy token), so it can
+			// inherit the active root and cancel owner.
 			return func() {}
 		}
 		<-interp.executionGate
@@ -916,7 +917,7 @@ func (interp *Interpreter) acquireExecutionWithContext(ctx context.Context) (fun
 	// Mirror the plain gate: a host callback on the paused execution (a
 	// writer, Stringer, or conversion hook calling back with a context)
 	// must not wait for the gate its own outer evaluation holds.
-	if executionIsReentrant() {
+	if executionIsReentrant(interp) {
 		return func() {}, nil
 	}
 	select {
@@ -927,38 +928,95 @@ func (interp *Interpreter) acquireExecutionWithContext(ctx context.Context) (fun
 	}
 }
 
-func executionIsReentrant() bool {
-	target := runtime.FuncForPC(reflect.ValueOf(runCfg).Pointer())
-	if target == nil {
+// executionToken records that a goroutine is running one interpreter
+// execution. The reentrancy bypass for the execution gate is scoped to the
+// goroutine, not probed from the native stack: any goroutine running
+// interpreted code has runCfg on its stack, including goroutines spawned by
+// an interpreted `go` statement, so a stack probe misreads an Eval from such
+// a goroutine as reentrant and lets it run concurrently with the gated
+// execution. With an explicit token, a host callback running synchronously
+// on the execution's goroutine (a writer, Stringer, or conversion hook) is
+// recognized at any native depth, while an Eval from a `go`-statement
+// goroutine waits for the gate like any unrelated goroutine.
+type executionToken struct {
+	interp *Interpreter
+	depth  int
+}
+
+type executionTokenStack struct {
+	stack []*executionToken
+}
+
+var executionTokens sync.Map // goroutine id (int) -> *executionTokenStack
+
+// currentGoroutineID extracts the running goroutine's id from its own
+// stack dump header ("goroutine N [running]:"). Only execution entry points
+// and the gate's contended path call this, never per-step code.
+func currentGoroutineID() int {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	line := buf[:n]
+	const prefix = "goroutine "
+	if !bytes.HasPrefix(line, []byte(prefix)) {
+		return 0
+	}
+	line = line[len(prefix):]
+	i := bytes.IndexByte(line, ' ')
+	if i < 0 {
+		return 0
+	}
+	id, err := strconv.Atoi(string(line[:i]))
+	if err != nil {
+		return 0
+	}
+	return id
+}
+
+// acquireExecutionToken marks the calling goroutine as running an execution
+// of interp. Nested synchronous re-entry of the same interpreter increments
+// the depth; a call crossing to another interpreter pushes a separate token
+// so the outer execution's bypass survives the inner release. A goroutine
+// never pops more than it pushed: every acquisition is released by a defer
+// in the same function of the same goroutine.
+func acquireExecutionToken(interp *Interpreter) {
+	id := currentGoroutineID()
+	if id == 0 {
+		return
+	}
+	entry, _ := executionTokens.LoadOrStore(id, &executionTokenStack{})
+	stack := entry.(*executionTokenStack)
+	if n := len(stack.stack); n > 0 && stack.stack[n-1].interp == interp {
+		stack.stack[n-1].depth++
+		return
+	}
+	stack.stack = append(stack.stack, &executionToken{interp: interp, depth: 1})
+}
+
+func releaseExecutionToken(interp *Interpreter) {
+	id := currentGoroutineID()
+	if id == 0 {
+		return
+	}
+	entry, ok := executionTokens.Load(id)
+	if !ok {
+		return
+	}
+	stack := entry.(*executionTokenStack)
+	if n := len(stack.stack); n > 0 && stack.stack[n-1].interp == interp {
+		stack.stack[n-1].depth--
+		if stack.stack[n-1].depth <= 0 {
+			stack.stack = stack.stack[:len(stack.stack)-1]
+		}
+	}
+}
+
+func executionIsReentrant(interp *Interpreter) bool {
+	entry, ok := executionTokens.Load(currentGoroutineID())
+	if !ok {
 		return false
 	}
-	// A host callback invoked from interpreted code can sit under an
-	// arbitrarily deep native stack (recursive marshaling, comparison or
-	// rendering code). A truncated walk would mistake a reentrant Eval on
-	// the paused execution for an unrelated goroutine and block forever on
-	// the execution gate, so the scan must cover the whole stack.
-	skip := 2
-	for {
-		pcs := make([]uintptr, 256)
-		count := runtime.Callers(skip, pcs)
-		if count == 0 {
-			return false
-		}
-		frames := runtime.CallersFrames(pcs[:count])
-		for {
-			frame, more := frames.Next()
-			if frame.Function == target.Name() {
-				return true
-			}
-			if !more {
-				break
-			}
-		}
-		if count < len(pcs) {
-			return false
-		}
-		skip += count
-	}
+	stack := entry.(*executionTokenStack)
+	return len(stack.stack) > 0 && stack.stack[len(stack.stack)-1].interp == interp
 }
 
 // Eval evaluates Go code represented as a string. Eval returns the last result
@@ -967,7 +1025,13 @@ func executionIsReentrant() bool {
 // Evaluations on the same interpreter are serialized: an Eval blocked in
 // interpreted code (for example a channel receive) prevents later Evals from
 // starting until it completes. Use EvalWithContext to bound or cancel a
-// blocking evaluation.
+// blocking evaluation. An Eval issued from a host callback running
+// synchronously on the paused execution's goroutine (a writer, a Stringer,
+// or a conversion hook) is recognized as reentrant and does not wait, at any
+// native call depth. Goroutines spawned by an interpreted `go` statement are
+// independent owners: an Eval from such a goroutine waits for the gate like
+// any unrelated goroutine, instead of running concurrently with the gated
+// execution.
 func (interp *Interpreter) Eval(src string) (res reflect.Value, err error) {
 	release := interp.acquireExecution()
 	defer release()

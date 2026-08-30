@@ -64,18 +64,17 @@
   (measured: ~255 KB per Eval across 20k sequential Evals). A host-facing
   purge API or self-describing wrapper metadata is needed before long-lived
   REPL-style interpreters are safe.
-- The context-aware gate path (EvalWithContext, EvalPathWithContext,
-  ExecuteWithContext) needs the same reentrancy bypass as the plain gate: a
-  host callback calling back with a context otherwise waits for the gate its
-  own outer evaluation holds, until the context expires (forever with
-  context.Background).
-- Reentrancy detection by stack scan has a known false positive: any goroutine
+- Reentrancy for the execution gate is an explicit token scoped to the
+  goroutine running the execution, not a native stack probe: any goroutine
   running interpreted code has runCfg on its stack, including goroutines
-  spawned by an interpreted `go` statement, so an Eval from a host callback on
-  such a goroutine bypasses the gate and can run concurrently with the gated
-  execution (observed as a data race between prepareExecutionFrame and the
-  running execution). The sound fix is an explicit execution/reentrancy token
-  threaded across the host-call boundary, not a stack probe.
+  spawned by an interpreted `go` statement, so a stack probe treats an Eval
+  from such a goroutine as reentrant and lets it run concurrently with the
+  gated execution (observed as a data race between prepareExecutionFrame and
+  the running execution). The token is set by the execution bodies
+  (executeWithPublication and source-package initialization), survives
+  arbitrarily deep native callback stacks, nests per interpreter, and is
+  never inherited by `go`-statement goroutines, whose Evals wait for the
+  gate like any unrelated goroutine.
 - Compilation entry points that can import source packages (Compile,
   CompileAST, CompilePath, EvalTest) execute package initialization during
   compilation and must take the execution gate like Eval, or interpreted init

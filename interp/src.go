@@ -286,6 +286,11 @@ func (interp *Interpreter) rollbackSourcePackageBuildLocked(importPath string, b
 // success; their next attempt runs on a detached root so partial globals from
 // cancellation or panic cannot become the package's committed state.
 func (interp *Interpreter) runSourcePackageInitLocked(prepared *sourcePackageInit) (string, error) {
+	// Source-package initialization runs interpreted steps on this
+	// goroutine; mark it like executeWithPublication so a synchronous host
+	// callback of the initializer can re-enter the interpreter.
+	acquireExecutionToken(interp)
+	defer releaseExecutionToken(interp)
 	compileOwner := interp.compileCancel
 	if prepared.phase == sourcePackageFailed && prepared.failedRoot != nil {
 		// The detach reads live cells of the failed root, whose canceled

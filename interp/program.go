@@ -240,6 +240,12 @@ func (interp *Interpreter) execute(p *Program, cancel <-chan struct{}) (res refl
 }
 
 func (interp *Interpreter) executeWithPublication(p *Program, cancel <-chan struct{}, publication *executionPublication) (res reflect.Value, err error) {
+	// Mark this goroutine as running the execution so a synchronous host
+	// callback can re-enter the interpreter without waiting on the gate,
+	// while Evals from unrelated goroutines (including `go`-statement
+	// goroutines) still wait.
+	acquireExecutionToken(interp)
+	defer releaseExecutionToken(interp)
 	// Compiler state, generated global wiring, and global-frame resizing share
 	// scopes and type tables. Keep them in one short serialized setup phase;
 	// interpreted execution itself remains unlocked so a later Eval can proceed
