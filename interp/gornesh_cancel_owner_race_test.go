@@ -49,12 +49,17 @@ func runCancelOwnerRewriteRound(t *testing.T) {
 	var enteredOnce sync.Once
 	done := make(chan struct{})
 	var doneOnce sync.Once
+	release := make(chan struct{})
 	if err := i.Use(interp.Exports{
 		"ownerrace/ownerrace": {
-			// Entered reports that the orphaned goroutine reached its loop;
+			// Entered reports that the orphaned goroutine reached its gate;
 			// Done reports that it finished even if its owner was never
-			// closed.
+			// closed. Wait blocks the orphan until the test releases it, so
+			// the read-dense loop below is guaranteed to still be running
+			// while the rewrite evals hammer the shared owner — the overlap
+			// is structural, not a timing race between goroutine schedules.
 			"Entered": reflect.ValueOf(func() { enteredOnce.Do(func() { close(entered) }) }),
+			"Wait":    reflect.ValueOf(func() { <-release }),
 			"Done":    reflect.ValueOf(func() { doneOnce.Do(func() { close(done) }) }),
 		},
 	}); err != nil {
@@ -75,8 +80,9 @@ func addOne(k int) int {
 
 go func() {
 	ownerrace.Entered()
+	ownerrace.Wait()
 	sum := 0
-	for k := 0; k < 600000; k++ {
+	for k := 0; k < 1000000; k++ {
 		sum = sum + addOne(k)
 	}
 	ownerrace.Done()
@@ -92,6 +98,9 @@ go func() {
 		t.Fatal("orphaned goroutine did not start")
 	}
 
+	// Release the orphan's native gate and hammer the owner rewrite
+	// immediately: the orphan's call loop is running from this point on.
+	close(release)
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		if _, err := i.Eval(`1 + 1`); err != nil {
@@ -110,7 +119,7 @@ go func() {
 
 	select {
 	case <-done:
-	case <-time.After(20 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("orphaned interpreted goroutine did not finish")
 	}
 }

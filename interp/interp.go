@@ -126,7 +126,7 @@ type frame struct {
 	deferred       []deferredCall             // defer stack
 	recovered      interface{}                // to handle panic recover
 	done           reflect.SelectCase         // for cancellation of channel operations
-	cancel         <-chan struct{}            // cancellation owner for this execution; guarded by mutex because prepareExecutionFrame rewrites it on a reused root (all reads must take the read lock, see canceled)
+	cancel         <-chan struct{}            // cancellation owner for this execution; guarded by mutex because prepareExecutionFrame rewrites it on a reused root (all reads must take the read lock, see canceled). Only the shared root's field is ever rewritten: every other frame's cancel is copied once by newFrame/clone under the parent's lock and frozen, so unlocked reads of f.cancel on non-root frames are race-free.
 	fenceExclusive atomic.Bool                // funcSweep fence mode captured at step acquisition
 	funcMeta       []reflect.Value            // interpreted wrappers registered by this activation
 	funcEscape     funcMetaRetention          // how wrappers crossed an opaque activation boundary
