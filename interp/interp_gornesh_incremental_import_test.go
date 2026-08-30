@@ -22,18 +22,36 @@ func TestGorneshIncrementalBinaryImportRemainsUsable(t *testing.T) {
 	}
 }
 
+// Expectations follow gc: only a reused binding name is a redeclaration,
+// and a repeated dot import re-exports colliding names. The same path under
+// another name, and blank imports, are legal.
 func TestGorneshSameFileDuplicateBinaryImportsFail(t *testing.T) {
 	tests := map[string]string{
 		"default": `import ("fmt"; "fmt")`,
-		"aliases": `import (first "fmt"; second "fmt")`,
 		"dot":     `import (. "fmt"; . "fmt")`,
-		"blank":   `import (_ "fmt"; _ "fmt")`,
 	}
 	for name, src := range tests {
 		t.Run(name, func(t *testing.T) {
 			i := newGorneshImportInterpreter(t)
 			if _, err := i.Eval(src); err == nil || !strings.Contains(err.Error(), "redeclared") {
 				t.Fatalf("duplicate import error = %v, want redeclaration diagnostic", err)
+			}
+		})
+	}
+}
+
+func TestGorneshSameFileRepeatedBinaryImportsLegalForms(t *testing.T) {
+	tests := map[string]string{
+		"aliases":         `import (first "fmt"; second "fmt"); first.Println(1); second.Println(2)`,
+		"blank":           `import (_ "fmt"; _ "fmt")`,
+		"dot and named":   `import (. "fmt"; fm "fmt"); Println(1); fm.Println(2)`,
+		"blank and named": `import (_ "fmt"; fm "fmt"); fm.Println(3)`,
+	}
+	for name, src := range tests {
+		t.Run(name, func(t *testing.T) {
+			i := newGorneshImportInterpreter(t)
+			if _, err := i.Eval(src); err != nil {
+				t.Fatalf("legal repeated import rejected: %v", err)
 			}
 		})
 	}

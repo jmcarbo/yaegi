@@ -36,8 +36,15 @@ func (interp *Interpreter) Compile(src string) (*Program, error) {
 
 // CompilePath parses and compiles a Go code located at the given path.
 func (interp *Interpreter) CompilePath(path string) (*Program, error) {
-	path = filepath.ToSlash(path) // Ensure path is in Unix format. Since we work with fs.FS, we need to use Unix path.
+	path = filepath.ToSlash(path) // Ensure path is in Unix format. Since we work with fs.FS, we need to use Unix format.
 	if !isFile(interp.filesystem, path) {
+		// Compiling a directory imports the source package, which runs its
+		// package initialization as interpreted code: take the execution
+		// gate so it cannot overlap an in-flight evaluation. A caller that
+		// already holds the gate (Execute on a directory program) is
+		// recognized as reentrant.
+		release := interp.acquireExecution()
+		defer release()
 		_, err := interp.importSrc(mainID, path, NoTest)
 		return nil, err
 	}

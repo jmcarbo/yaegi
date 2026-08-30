@@ -160,6 +160,107 @@ func TestGorneshReturnChannelReceiveInDeclaredFunc(t *testing.T) {
 	}
 }
 
+// TestGorneshReentrantEvalFromDeepNativeStack pins reentrant Eval detection
+// for host callbacks sitting under a deep native stack. The reentrancy probe
+// must walk the whole stack: a host function that recurses natively before
+// calling back into Eval used to be misread as an unrelated goroutine once the
+// recursion passed the probe's fixed window, deadlocking the nested Eval on
+// the execution gate while the outer Eval waited for the callback.
+func TestGorneshReentrantEvalFromDeepNativeStack(t *testing.T) {
+	i := interp.New(interp.Options{})
+	var nested func() int
+	var recNative func(int) int
+	recNative = func(n int) int {
+		if n == 0 {
+			return nested()
+		}
+		return recNative(n-1) + 1
+	}
+	nested = func() int {
+		v, err := i.Eval("40 + 2")
+		if err != nil {
+			t.Error(err)
+			return -1
+		}
+		return int(v.Int())
+	}
+	if err := i.Use(interp.Exports{"gorneshdeep/gorneshdeep": {
+		"Recurse": reflect.ValueOf(recNative),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := i.Eval("import \"gorneshdeep\""); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := i.Eval("gorneshdeep.Recurse(100)")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("reentrant Eval from a deep native stack blocked on the execution gate")
+	}
+}
+
+// TestGorneshEvalTestPackageInitWaitsForRunningEval pins execution-gate
+// coverage for EvalTest: a source package's initialization runs interpreted
+// code, so it must wait for an in-flight evaluation instead of overlapping it.
+func TestGorneshEvalTestPackageInitWaitsForRunningEval(t *testing.T) {
+	var entered atomic.Int32
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	i := interp.New(interp.Options{
+		GoPath: "gopath",
+		SourcecodeFilesystem: fstest.MapFS{
+			"gopath/src/gatepkg/gatepkg.go": {Data: []byte(`package gatepkg
+import "gatehost"
+var Entered = gatehost.Enter()
+`)},
+		},
+	})
+	if err := i.Use(interp.Exports{"gatehost/gatehost": {
+		"Block": reflect.ValueOf(func() { close(blocked); <-release }),
+		"Enter": reflect.ValueOf(func() int { return int(entered.Add(1)) }),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := i.Eval(`import "gatehost"`); err != nil {
+		t.Fatal(err)
+	}
+	evalDone := make(chan error, 1)
+	go func() {
+		_, err := i.Eval(`gatehost.Block()`)
+		evalDone <- err
+	}()
+	<-blocked
+
+	testDone := make(chan error, 1)
+	go func() { testDone <- i.EvalTest("gatepkg") }()
+
+	// The package initializer must stay parked behind the blocked Eval.
+	time.Sleep(250 * time.Millisecond)
+	if got := entered.Load(); got != 0 {
+		close(release)
+		t.Fatalf("EvalTest package init ran concurrently with blocked Eval (entered=%d)", got)
+	}
+	close(release)
+	if err := <-evalDone; err != nil {
+		t.Fatalf("blocked eval failed: %v", err)
+	}
+	if err := <-testDone; err != nil {
+		t.Fatalf("EvalTest failed: %v", err)
+	}
+	if got := entered.Load(); got != 1 {
+		t.Fatalf("EvalTest package init host calls = %d, want 1", got)
+	}
+}
+
 // TestGorneshZombieDeferredWritesDoNotRaceNewEvals pins the zombie drain
 // barrier: a canceled evaluation's deferred calls still run, but they must
 // not overlap the execution of a later evaluation on the same interpreter.

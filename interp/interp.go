@@ -120,20 +120,21 @@ type frame struct {
 	anc  *frame          // ancestor frame (caller space)
 	data []reflect.Value // values
 
-	mutex         sync.RWMutex
-	callArgs      map[*node]reflect.Value    // transient left-to-right call argument snapshots
-	deferred      []deferredCall             // defer stack
-	recovered     interface{}                // to handle panic recover
-	done          reflect.SelectCase         // for cancellation of channel operations
-	cancel        <-chan struct{}            // immutable cancellation owner for this execution
-	funcMeta      []reflect.Value            // interpreted wrappers registered by this activation
-	funcEscape    funcMetaRetention          // how wrappers crossed an opaque activation boundary
-	funcState     funcFrameState             // lifecycle of metadata owned by this activation
-	cloneOf       *frame                     // live activation whose lexical slots this clone shares
-	funcCarrier   reflect.Value              // wrapper whose closure keeps this lexical clone alive
-	funcGroup     *funcMetaGroup             // wrappers created by this activation
-	ownedObjects  map[*ownedObject]struct{}  // reference-backed allocations created by this activation
-	ownedChannels map[*ownedChannel]struct{} // channels created by this activation
+	mutex          sync.RWMutex
+	callArgs       map[*node]reflect.Value    // transient left-to-right call argument snapshots
+	deferred       []deferredCall             // defer stack
+	recovered      interface{}                // to handle panic recover
+	done           reflect.SelectCase         // for cancellation of channel operations
+	cancel         <-chan struct{}            // immutable cancellation owner for this execution
+	fenceExclusive atomic.Bool                // funcSweep fence mode captured at step acquisition
+	funcMeta       []reflect.Value            // interpreted wrappers registered by this activation
+	funcEscape     funcMetaRetention          // how wrappers crossed an opaque activation boundary
+	funcState      funcFrameState             // lifecycle of metadata owned by this activation
+	cloneOf        *frame                     // live activation whose lexical slots this clone shares
+	funcCarrier    reflect.Value              // wrapper whose closure keeps this lexical clone alive
+	funcGroup      *funcMetaGroup             // wrappers created by this activation
+	ownedObjects   map[*ownedObject]struct{}  // reference-backed allocations created by this activation
+	ownedChannels  map[*ownedChannel]struct{} // channels created by this activation
 }
 
 type deferredCall struct {
@@ -876,17 +877,32 @@ func executionIsReentrant() bool {
 	if target == nil {
 		return false
 	}
-	var pcs [64]uintptr
-	count := runtime.Callers(2, pcs[:])
-	frames := runtime.CallersFrames(pcs[:count])
+	// A host callback invoked from interpreted code can sit under an
+	// arbitrarily deep native stack (recursive marshaling, comparison or
+	// rendering code). A truncated walk would mistake a reentrant Eval on
+	// the paused execution for an unrelated goroutine and block forever on
+	// the execution gate, so the scan must cover the whole stack.
+	skip := 2
 	for {
-		frame, more := frames.Next()
-		if frame.Function == target.Name() {
-			return true
-		}
-		if !more {
+		pcs := make([]uintptr, 256)
+		count := runtime.Callers(skip, pcs)
+		if count == 0 {
 			return false
 		}
+		frames := runtime.CallersFrames(pcs[:count])
+		for {
+			frame, more := frames.Next()
+			if frame.Function == target.Name() {
+				return true
+			}
+			if !more {
+				break
+			}
+		}
+		if count < len(pcs) {
+			return false
+		}
+		skip += count
 	}
 }
 
@@ -980,6 +996,10 @@ func (interp *Interpreter) EvalPathWithContext(ctx context.Context, path string)
 // The main function, test functions and benchmark functions are internally compiled but not
 // executed. Test functions can be retrieved using the Symbol() method.
 func (interp *Interpreter) EvalTest(path string) error {
+	// Package-level initialization runs interpreted source, so it must not
+	// overlap an in-flight evaluation: take the execution gate like Eval.
+	release := interp.acquireExecution()
+	defer release()
 	_, err := interp.importSrc(mainID, path, Test)
 	return err
 }

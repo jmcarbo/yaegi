@@ -37,3 +37,27 @@
   copy instead, or a later write into that cell (for example the regular-
   return Set for `return <-ch`) panics with "reflect: reflect.Value.Set using
   unaddressable value".
+- A step that acquires the funcSweep fence must release it in the mode that was
+  acquired, not the mode a re-read of zombieDefers would now derive: the
+  counter is flipped by the canceled worker's goroutine and can change mid-step
+  between acquisition and release. The acquired mode is captured on the frame
+  (with save/restore so a reentrant Eval nesting on the same global frame keeps
+  the outer mode); the release helpers consult the capture. Re-deriving the
+  mode at release fatal-errors in sync ("RUnlock/Unlock of unlocked RWMutex")
+  and kills the embedding process.
+- Reentrancy detection for a nested Eval from a host callback must walk the
+  entire native stack: a callback under deep native recursion (marshaling,
+  comparison, rendering) passes any fixed PC-window, is misread as an unrelated
+  goroutine, and deadlocks the nested Eval on the execution gate.
+- Known growth boundary: owned allocations are registered per make/new/composite
+  literal and released at frame exit or Eval end, so a single frame that runs
+  forever (a loop allocating in an interpreted daemon) grows the registry
+  without bound (measured: an interpreted loop of map literals reached ~60 GB
+  RSS in minutes, while master stays flat). Bounding this safely requires
+  mid-execution reachability over all active frame chains, not just the root.
+- Known growth boundary: interpreted function values that cross the Eval API
+  keep their metadata marked opaque, which is never deleted, so every returned
+  or host-retained closure pins its captures and compiled graph permanently
+  (measured: ~255 KB per Eval across 20k sequential Evals). A host-facing
+  purge API or self-describing wrapper metadata is needed before long-lived
+  REPL-style interpreters are safe.

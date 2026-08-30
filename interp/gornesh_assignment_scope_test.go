@@ -63,7 +63,7 @@ func TestGorneshMultiAssignmentPreservesParallelEvaluation(t *testing.T) {
 	}
 }
 
-func TestGorneshMultiAssignmentFreezesMapReceiverAndKeyBeforeRHS(t *testing.T) {
+func TestGorneshMultiAssignmentMapReceiverAndKeyResolution(t *testing.T) {
 	i := interp.New(interp.Options{})
 	evalGorneshFlow(t, i, `func replaceMapAndKey(target *map[int]int, key *int) int {
 		*target = map[int]int{0: 10, 1: 20}
@@ -71,14 +71,29 @@ func TestGorneshMultiAssignmentFreezesMapReceiverAndKeyBeforeRHS(t *testing.T) {
 		return 7
 	}`)
 
+	// Matches gc: a passive (variable) map receiver and key are resolved
+	// when the assignment is applied, so a right-hand-side call that
+	// rebinds either variable redirects the write.
 	got := evalGorneshFlow(t, i, `oldMap := map[int]int{0: 1, 1: 2}
 		currentMap := oldMap
 		key := 0
 		other := 0
 		currentMap[key], other = 5, replaceMapAndKey(&currentMap, &key)
 		[]int{oldMap[0], oldMap[1], currentMap[0], currentMap[1], key, other}`)
-	if got != "[5 2 10 20 1 7]" {
-		t.Fatalf("map receiver/key were not frozen before RHS evaluation: got %s", got)
+	if got != "[1 2 10 5 1 7]" {
+		t.Fatalf("map receiver/key were not resolved at assignment time: got %s, want [1 2 10 5 1 7]", got)
+	}
+
+	// A non-passive key operand keeps its phase-1 evaluation order and
+	// value: the call is evaluated before the right-hand side and its
+	// result is retained even though the key variable moves.
+	evalGorneshFlow(t, i, "func nextKey() int { return 9 }")
+	got = evalGorneshFlow(t, i, `m := map[int]int{5: 42}
+		n := 0
+		m[nextKey()], n = 7, 2
+		[]int{m[0], m[2], m[9], n}`)
+	if got != "[0 0 7 2]" {
+		t.Fatalf("non-passive map key was not snapshotted before RHS: got %s, want [0 0 7 2]", got)
 	}
 }
 

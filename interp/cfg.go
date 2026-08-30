@@ -2883,16 +2883,24 @@ func wireMultiAssignSnapshots(n *node, sc *scope) {
 	}
 
 	// Go evaluates the operands of the left-hand side before the right-hand
-	// side. A map assignment must retain both the selected map and key because
-	// a later right-hand-side call may mutate either operand before the final
-	// updates are applied.
+	// side, but gc resolves a variable operand when the assignment is
+	// applied: a right-hand-side call that rebinds the map or the key
+	// variable redirects the write to the new binding. Only non-passive
+	// operands need a snapshot, to keep their phase-1 evaluation order and
+	// retain their value for phase 2. A passive slot keeps a -1 sentinel.
 	for _, dest := range n.child[:n.nleft] {
 		if isMapEntry(dest) {
 			receiver := dest.child[0]
 			key := dest.child[1]
-			dest.assignTmp = []int{
-				appendSnapshot(receiver, receiver.typ),
-				appendSnapshot(key, valueTOf(receiver.typ.TypeOf().Key())),
+			tmp := []int{-1, -1}
+			if !passiveAssignOperand(receiver) {
+				tmp[0] = appendSnapshot(receiver, receiver.typ)
+			}
+			if !passiveAssignOperand(key) {
+				tmp[1] = appendSnapshot(key, valueTOf(receiver.typ.TypeOf().Key()))
+			}
+			if tmp[0] >= 0 || tmp[1] >= 0 {
+				dest.assignTmp = tmp
 			}
 			continue
 		}

@@ -507,20 +507,34 @@ func execWithFuncSweepFence(exec bltn, f *frame) (next bltn) {
 		// through here, so the release must be panic-safe.
 		f.interp.funcSweepMu.Lock()
 		f.interp.funcSweepExclusive.Add(1)
+		previous := f.fenceExclusive.Swap(true)
 		defer func() {
+			f.fenceExclusive.Store(previous)
 			f.interp.funcSweepExclusive.Add(-1)
 			f.interp.funcSweepMu.Unlock()
 		}()
 		return exec(f)
 	}
 	f.interp.funcSweepMu.RLock()
-	defer f.interp.funcSweepMu.RUnlock()
+	previous := f.fenceExclusive.Swap(false)
+	defer func() {
+		f.fenceExclusive.Store(previous)
+		f.interp.funcSweepMu.RUnlock()
+	}()
 	return exec(f)
 }
 
+// The fence release helpers below must unlock in the mode that was acquired
+// for the enclosing step, not in the mode they would re-derive now: the
+// zombieDefers counter can flip mid-step while a canceled worker starts or
+// finishes its deferred unwind on another goroutine, and releasing in a
+// re-derived mode corrupts the RWMutex fatally. The mode acquired by
+// execWithFuncSweepFence is captured in f.fenceExclusive and restored when
+// the same frame nests another acquisition (a reentrant Eval on the paused
+// execution runs its steps on the same global frame).
+
 func callWithFuncSweepFenceReleased(f *frame, call func() []reflect.Value) (out []reflect.Value) {
-	exclusive := f.interp.zombieDefers.Load() > 0
-	if exclusive {
+	if f.fenceExclusive.Load() {
 		f.interp.funcSweepMu.Unlock()
 		defer f.interp.funcSweepMu.Lock()
 	} else {
@@ -531,8 +545,7 @@ func callWithFuncSweepFenceReleased(f *frame, call func() []reflect.Value) (out 
 }
 
 func runWithFuncSweepFenceReleased(f *frame, run func()) {
-	exclusive := f.interp.zombieDefers.Load() > 0
-	if exclusive {
+	if f.fenceExclusive.Load() {
 		f.interp.funcSweepMu.Unlock()
 		defer f.interp.funcSweepMu.Lock()
 	} else {
@@ -543,8 +556,7 @@ func runWithFuncSweepFenceReleased(f *frame, run func()) {
 }
 
 func selectWithFuncSweepFenceReleased(f *frame, cases []reflect.SelectCase) (chosen int, recv reflect.Value, recvOK bool) {
-	exclusive := f.interp.zombieDefers.Load() > 0
-	if exclusive {
+	if f.fenceExclusive.Load() {
 		f.interp.funcSweepMu.Unlock()
 		defer f.interp.funcSweepMu.Lock()
 	} else {
@@ -555,8 +567,7 @@ func selectWithFuncSweepFenceReleased(f *frame, cases []reflect.SelectCase) (cho
 }
 
 func recvWithFuncSweepFenceReleased(f *frame, channel reflect.Value) (value reflect.Value, ok bool) {
-	exclusive := f.interp.zombieDefers.Load() > 0
-	if exclusive {
+	if f.fenceExclusive.Load() {
 		f.interp.funcSweepMu.Unlock()
 		defer f.interp.funcSweepMu.Lock()
 	} else {
@@ -567,8 +578,7 @@ func recvWithFuncSweepFenceReleased(f *frame, channel reflect.Value) (value refl
 }
 
 func sendWithFuncSweepFenceReleased(f *frame, channel, value reflect.Value) {
-	exclusive := f.interp.zombieDefers.Load() > 0
-	if exclusive {
+	if f.fenceExclusive.Load() {
 		f.interp.funcSweepMu.Unlock()
 		defer f.interp.funcSweepMu.Lock()
 	} else {
@@ -1033,17 +1043,23 @@ func assign(n *node) {
 			svalue[i] = genDestValue(dest.typ, src)
 		}
 		if isMapEntry(dest) {
-			if len(dest.assignTmp) == 2 {
-				receiverIndex, keyIndex := dest.assignTmp[0], dest.assignTmp[1]
+			// A snapshotted receiver or key (non-passive operand) is read
+			// from its stable slot; passive ones are read when the
+			// assignment is applied, matching gc.
+			if len(dest.assignTmp) == 2 && dest.assignTmp[0] >= 0 {
+				receiverIndex := dest.assignTmp[0]
 				dvalue[i] = func(f *frame) reflect.Value { return f.data[receiverIndex] }
-				ivalue[i] = func(f *frame) reflect.Value { return f.data[keyIndex] }
 			} else {
-				if isInterfaceSrc(dest.child[1].typ) { // key
-					ivalue[i] = genValueInterface(dest.child[1])
-				} else {
-					ivalue[i] = genValue(dest.child[1])
-				}
 				dvalue[i] = genValue(dest.child[0])
+			}
+			switch {
+			case len(dest.assignTmp) == 2 && dest.assignTmp[1] >= 0:
+				keyIndex := dest.assignTmp[1]
+				ivalue[i] = func(f *frame) reflect.Value { return f.data[keyIndex] }
+			case isInterfaceSrc(dest.child[1].typ): // key
+				ivalue[i] = genValueInterface(dest.child[1])
+			default:
+				ivalue[i] = genValue(dest.child[1])
 			}
 		} else {
 			dvalue[i] = genValue(dest)

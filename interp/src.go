@@ -288,11 +288,17 @@ func (interp *Interpreter) rollbackSourcePackageBuildLocked(importPath string, b
 func (interp *Interpreter) runSourcePackageInitLocked(prepared *sourcePackageInit) (string, error) {
 	compileOwner := interp.compileCancel
 	if prepared.phase == sourcePackageFailed && prepared.failedRoot != nil {
+		// The detach reads live cells of the failed root, whose canceled
+		// worker may still be unwinding deferred calls. Detach under the
+		// same exclusive fence prepareExecutionFrame uses, so the walk
+		// cannot observe a half-written cell.
+		interp.funcSweepMu.Lock()
 		interp.mutex.Lock()
 		if interp.frame == prepared.failedRoot {
 			interp.frame = interp.frame.cloneDetached(compileOwner)
 		}
 		interp.mutex.Unlock()
+		interp.funcSweepMu.Unlock()
 	}
 	prepared.generation++
 	attempt := prepared.generation

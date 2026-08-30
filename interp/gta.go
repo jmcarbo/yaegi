@@ -257,15 +257,34 @@ func (interp *Interpreter) gta(root *node, rpath, importPath, pkgName string) ([
 				if name == "" {
 					name = interp.pkgNames[ipath]
 				}
-				if seenBinaryImports[ipath] {
-					errName := name
-					if name != "." && name != "_" {
-						errName = path.Join(name, baseName)
+				// Per the Go spec, an import spec binds one name in the file
+				// block: only reusing that binding name is a redeclaration,
+				// and a repeated dot import re-exports colliding names. The
+				// same package path may legally be imported again under
+				// another name, and blank imports bind nothing.
+				switch name {
+				case "_":
+				case ".":
+					dotKey := "\x00dotimport:" + ipath
+					if seenBinaryImports[dotKey] {
+						errName := ipath
+						for importedName := range pkg {
+							if _, exists := sc.sym[importedName]; exists {
+								errName = importedName
+								break
+							}
+						}
+						err = n.cfgErrorf("%s redeclared in this block", errName)
+						return false
 					}
-					err = n.cfgErrorf("%s redeclared in this block", errName)
-					return false
+					seenBinaryImports[dotKey] = true
+				default:
+					if seenBinaryImports[name] {
+						err = n.cfgErrorf("%s redeclared in this block", name)
+						return false
+					}
+					seenBinaryImports[name] = true
 				}
-				seenBinaryImports[ipath] = true
 
 				// Imports from separate incremental Eval cells share a package scope and
 				// source name. Keep an import marker so the same binding can be retried,
