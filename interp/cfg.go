@@ -571,7 +571,17 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 			if n.typ, err = nodeType(interp, sc, n); err != nil {
 				return false
 			}
-			n.findex = sc.add(n.typ)
+			if isRootImmediateFuncLit(n, sc) {
+				// Immediately-called root-level literal: its call activates the
+				// body directly (the declared-function path of run.go call), so
+				// no persistent global slot is allocated for a wrapper value no
+				// statement can ever read. See LEARNINGS, "func-leading REPL
+				// Eval slot growth".
+				n.findex = notInFrame
+				n.gen = nop
+			} else {
+				n.findex = sc.add(n.typ)
+			}
 			fallthrough
 
 		case funcDecl:
@@ -1514,7 +1524,13 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 					break
 				}
 
-				if c0.action == aGetFunc {
+				if isRootImmediateFuncLit(c0, sc) {
+					// The call activates the literal body directly; there is no
+					// wrapper value to snapshot ahead of the arguments.
+					snapshotFunc = false
+				}
+
+				if c0.action == aGetFunc && !isRootImmediateFuncLit(c0, sc) {
 					// Allocate a frame entry to store the anonymous function definition.
 					sc.add(c0.typ)
 				}
@@ -2795,6 +2811,22 @@ func (n *node) isType(sc *scope) bool {
 		return ok && sym.kind == typeSym
 	}
 	return false
+}
+
+// isRootImmediateFuncLit reports whether n is a function literal sitting in
+// the function position of a call expression, compiled at global frame level,
+// outside a defer statement. Such a literal is activated directly by its call
+// before any later statement can run: no wrapper value is ever read, so
+// allocating its persistent global slot would grow the REPL frame by one to
+// three slots per Eval (see LEARNINGS, "func-leading REPL Eval slot growth").
+func isRootImmediateFuncLit(n *node, sc *scope) bool {
+	if n.kind != funcLit || n.anc == nil || n.anc.kind != callExpr || childPos(n) != 0 {
+		return false
+	}
+	if !sc.global {
+		return false
+	}
+	return n.anc.anc == nil || n.anc.anc.kind != deferStmt
 }
 
 // wireChild wires AST nodes for CFG in subtree.
