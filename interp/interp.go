@@ -980,7 +980,12 @@ func (interp *Interpreter) acquireExecutionWithContext(ctx context.Context) (fun
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-interp.executionGate:
-		return func() { interp.executionGate <- struct{}{} }, nil
+		id := currentGoroutineID()
+		interp.gateHolderGoid.Store(int64(id))
+		return func() {
+			interp.gateHolderGoid.CompareAndSwap(int64(id), 0)
+			interp.executionGate <- struct{}{}
+		}, nil
 	}
 }
 
