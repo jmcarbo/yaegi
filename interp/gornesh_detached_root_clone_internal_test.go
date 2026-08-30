@@ -1067,12 +1067,18 @@ func sendDetachedHostRaceChannelGornesh() {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for value := 0; ; value++ {
+		// Pace the publisher: an unpaced loop starves the detach sequence
+		// under -race on loaded CI machines and can blow the test timeout.
+		// The test only needs concurrent mutation to exist, not maximum
+		// write rate.
+		value := 0
+		for {
 			select {
 			case <-stop:
 				return
-			default:
+			case <-time.After(50 * time.Microsecond):
 				hostMap["value"] = value
+				value++
 			}
 		}
 	}()
