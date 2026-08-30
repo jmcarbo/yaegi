@@ -48,10 +48,6 @@
   the outer mode); the release helpers consult the capture. Re-deriving the
   mode at release fatal-errors in sync ("RUnlock/Unlock of unlocked RWMutex")
   and kills the embedding process.
-- Reentrancy detection for a nested Eval from a host callback must walk the
-  entire native stack: a callback under deep native recursion (marshaling,
-  comparison, rendering) passes any fixed PC-window, is misread as an unrelated
-  goroutine, and deadlocks the nested Eval on the execution gate.
 - Known growth boundary: owned allocations are registered per make/new/composite
   literal and released at frame exit or Eval end, so a single frame that runs
   forever (a loop allocating in an interpreted daemon) grows the registry
@@ -87,11 +83,20 @@
   spawned by an interpreted `go` statement, so a stack probe treats an Eval
   from such a goroutine as reentrant and lets it run concurrently with the
   gated execution (observed as a data race between prepareExecutionFrame and
-  the running execution). The token is set by the execution bodies
-  (executeWithPublication and source-package initialization), survives
-  arbitrarily deep native callback stacks, nests per interpreter, and is
-  never inherited by `go`-statement goroutines, whose Evals wait for the
-  gate like any unrelated goroutine.
+  the running execution). The bypass is decided live at gate-acquisition
+  time: the gate-holding goroutine may always re-enter (including an inline
+  source-package init retry whose ambient owner already fired), and any
+  other token holder may re-enter only while its execution's owner channel
+  is still open — read at decision time, never sampled, because a
+  cancellation landing while a canceled worker is parked inside a deferred
+  host call must strip the bypass for the rest of the drain (a sampled flag
+  is a TOCTOU hole, reproduced end-to-end). The token survives arbitrarily
+  deep native callback stacks, nests per interpreter, is never inherited by
+  `go`-statement goroutines, and its per-goroutine entry is reclaimed when
+  the stack empties. The drain joins the zombie fence accounting at every
+  deferred-call boundary, so a cancellation firing mid-drain still fences
+  the remaining interpreted deferred steps (at deferred-call granularity: a
+  body already in flight finishes its steps on the shared fence).
 - Compilation entry points that can import source packages (Compile,
   CompileAST, CompilePath, EvalTest) execute package initialization during
   compilation and must take the execution gate like Eval, or interpreted init

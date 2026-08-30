@@ -126,7 +126,7 @@ type frame struct {
 	deferred       []deferredCall             // defer stack
 	recovered      interface{}                // to handle panic recover
 	done           reflect.SelectCase         // for cancellation of channel operations
-	cancel         <-chan struct{}            // cancellation owner for this execution; guarded by mutex because prepareExecutionFrame rewrites it on a reused root (all reads must take the read lock, see canceled). Only the shared root's field is ever rewritten: every other frame's cancel is copied once by newFrame/clone under the parent's lock and frozen, so unlocked reads of f.cancel on non-root frames are race-free.
+	cancel         <-chan struct{}            // cancellation owner for this execution; the shared root's field is rewritten by prepareExecutionFrame under mutex, so shared-root reads must take the read lock (see canceled). Every other frame's cancel is copied once by newFrame/clone under the parent's lock and frozen, so unlocked reads of f.cancel on non-root frames are race-free.
 	fenceExclusive atomic.Bool                // funcSweep fence mode captured at step acquisition
 	funcMeta       []reflect.Value            // interpreted wrappers registered by this activation
 	funcEscape     funcMetaRetention          // how wrappers crossed an opaque activation boundary
@@ -1091,8 +1091,6 @@ func innermostExecutionToken(interp *Interpreter) (*executionToken, bool) {
 	}
 	return stack.stack[len(stack.stack)-1], true
 }
-
-
 
 // Eval evaluates Go code represented as a string. Eval returns the last result
 // computed by the interpreter, and a non nil error in case of failure.
