@@ -29,9 +29,12 @@
   has returned, so the execution gate no longer excludes it from later
   evaluations. While such a zombie unwinds, its interpreted steps hold the
   funcSweep fence exclusively (tracked by a counter, so nested frames and
-  native stretches behave correctly): deferred writes can never race a later
-  evaluation's writes on shared containers, and a zombie defer blocked in a
-  host call still releases the fence and never blocks later evaluations.
+  native stretches behave correctly): interpreted deferred writes are fenced
+  against a later evaluation's interpreted steps on shared containers. Native
+  deferred calls run outside the fence — a host function value deferred by
+  interpreted code writes through host code the interpreter cannot fence — and
+  a zombie defer blocked in a host call still releases the fence and never
+  blocks later evaluations.
 - Channel receives store an unaddressable copy. Any interpreter path that
   writes a received value directly into a frame cell must store an addressable
   copy instead, or a later write into that cell (for example the regular-

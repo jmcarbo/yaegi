@@ -125,7 +125,7 @@ type frame struct {
 	deferred       []deferredCall             // defer stack
 	recovered      interface{}                // to handle panic recover
 	done           reflect.SelectCase         // for cancellation of channel operations
-	cancel         <-chan struct{}            // immutable cancellation owner for this execution
+	cancel         <-chan struct{}            // cancellation owner for this execution; guarded by mutex because prepareExecutionFrame rewrites it on a reused root (all reads must take the read lock, see canceled)
 	fenceExclusive atomic.Bool                // funcSweep fence mode captured at step acquisition
 	funcMeta       []reflect.Value            // interpreted wrappers registered by this activation
 	funcEscape     funcMetaRetention          // how wrappers crossed an opaque activation boundary
@@ -328,8 +328,14 @@ func newFrame(anc *frame, length int, id uint64) *frame {
 		f.root = f
 	} else {
 		f.interp = anc.interp
+		// The owner of a shared root can be rewritten by a later evaluation
+		// (prepareExecutionFrame); copy it under the root's lock so a frame
+		// created by an orphaned goroutine (a deferred call unwinding after
+		// cancellation) cannot race that rewrite.
+		anc.mutex.RLock()
 		f.done = anc.done
 		f.cancel = anc.cancel
+		anc.mutex.RUnlock()
 		f.root = anc.root
 	}
 	return f
@@ -338,11 +344,19 @@ func newFrame(anc *frame, length int, id uint64) *frame {
 func (f *frame) runid() uint64      { return atomic.LoadUint64(&f.id) }
 func (f *frame) setrunid(id uint64) { atomic.StoreUint64(&f.id, id) }
 func (f *frame) canceled() bool {
-	if f.cancel == nil {
+	// The cancellation owner of a shared root is rewritten by
+	// prepareExecutionFrame under f.mutex, while interpreted goroutines that
+	// outlive their evaluation (a `go` statement, a canceled worker draining
+	// its deferred calls) keep reading it without any other synchronization.
+	// Take the read lock so those reads cannot race the rewrite.
+	f.mutex.RLock()
+	cancel := f.cancel
+	f.mutex.RUnlock()
+	if cancel == nil {
 		return false
 	}
 	select {
-	case <-f.cancel:
+	case <-cancel:
 		return true
 	default:
 		return false
@@ -1150,7 +1164,14 @@ func ignoreScannerError(e *scanner.Error, s string) bool {
 // constructed by replacing the last "/" by a "_", producing crypto_rand and math_rand.
 // ImportUsed should not be called more than once, and not after a first Eval, as it may
 // rename packages.
+//
+// ImportUsed mutates the interpreter symbol tables, so it is serialized with
+// evaluations on the same interpreter like Eval: it waits for an in-flight
+// evaluation to complete, and a host callback of a paused evaluation is
+// recognized as reentrant.
 func (interp *Interpreter) ImportUsed() {
+	release := interp.acquireExecution()
+	defer release()
 	sc := interp.universe
 	for k := range interp.binPkg {
 		// By construction, the package name is the last path element of the key.

@@ -4699,8 +4699,11 @@ func recv(n *node) {
 		if n.fnext != nil {
 			fnext := getExec(n.fnext)
 			n.exec = func(f *frame) bltn {
-				if r, _ := recvWithFuncSweepFenceReleased(f, value(f)); r.Bool() {
-					getFrame(f, l).data[i] = r
+				ch := value(f)
+				r, _ := recvWithFuncSweepFenceReleased(f, ch)
+				r = f.interp.adoptInterpretedFuncValue(f, ch, r)
+				store(f, r)
+				if r.Bool() {
 					return tnext
 				}
 				return fnext
