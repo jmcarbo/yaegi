@@ -517,6 +517,13 @@ type Interpreter struct {
 	// call to relinquish ownership before a native call returns. A later run can
 	// then detach the canceled root without sharing its mutable cancel owner.
 	executionGate chan struct{}
+	// gateHolderGoid is the goroutine id of the goroutine that currently
+	// holds executionGate (0 when free). The holder may always re-enter its
+	// own interpreter: a nested Eval from a host callback of an inline
+	// execution — including a source-package init retry whose ambient
+	// cancellation owner already fired — must not block on the gate its own
+	// goroutine holds.
+	gateHolderGoid atomic.Int64
 	// zombieBarrier serializes the deferred phase of a canceled (zombie)
 	// worker against the whole execution of a later evaluation. A canceled
 	// worker's deferred calls still run (they drive ownership publication),
@@ -904,30 +911,69 @@ func (interp *Interpreter) resizeFrameTo(f *frame) {
 func (interp *Interpreter) acquireExecution() func() {
 	select {
 	case <-interp.executionGate:
-		return func() { interp.executionGate <- struct{}{} }
+		id := currentGoroutineID()
+		interp.gateHolderGoid.Store(int64(id))
+		return func() {
+			interp.gateHolderGoid.CompareAndSwap(int64(id), 0)
+			interp.executionGate <- struct{}{}
+		}
 	default:
-		if token, ok := innermostExecutionToken(interp); ok && !token.zombie {
+		if executionMayReenter(interp) {
 			// Writers, Stringers, and conversion hooks may synchronously call
-			// back into the same interpreter. This goroutine is running the
-			// paused execution (it carries its reentrancy token), so it can
-			// inherit the active root and cancel owner. A zombie token — a
-			// canceled worker draining deferred calls after the API call
-			// returned — runs outside the gate and must not bypass: its
-			// prepareExecutionFrame would rewrite the live root's owner
-			// concurrently with the gated execution now holding the gate.
+			// back into the same interpreter. This goroutine either holds the
+			// gate itself or runs a live (not canceled) execution (it carries
+			// the reentrancy token), so it can inherit the active root and
+			// cancel owner. A canceled worker draining deferred calls after
+			// the API call returned runs outside the gate and must not
+			// bypass: its prepareExecutionFrame would rewrite the live
+			// root's owner concurrently with the gated execution now holding
+			// the gate.
 			return func() {}
 		}
 		<-interp.executionGate
-		return func() { interp.executionGate <- struct{}{} }
+		id := currentGoroutineID()
+		interp.gateHolderGoid.Store(int64(id))
+		return func() {
+			interp.gateHolderGoid.CompareAndSwap(int64(id), 0)
+			interp.executionGate <- struct{}{}
+		}
+	}
+}
+
+// executionMayReenter decides the gate bypass for the calling goroutine. It
+// holds when the goroutine itself holds the execution gate, or when it runs
+// a token whose execution owner is still live. The owner is read at decision
+// time, not sampled once when the execution unwinds: a cancellation that
+// lands while the goroutine is parked inside a deferred host call must
+// remove the bypass for the rest of the drain, so a sampled flag would be a
+// TOCTOU hole.
+func executionMayReenter(interp *Interpreter) bool {
+	id := currentGoroutineID()
+	if id != 0 && interp.gateHolderGoid.Load() == int64(id) {
+		return true
+	}
+	token, ok := innermostExecutionToken(interp)
+	if !ok {
+		return false
+	}
+	return token.owner == nil || !ownerCanceled(token.owner)
+}
+
+func ownerCanceled(cancel <-chan struct{}) bool {
+	select {
+	case <-cancel:
+		return true
+	default:
+		return false
 	}
 }
 
 func (interp *Interpreter) acquireExecutionWithContext(ctx context.Context) (func(), error) {
 	// Mirror the plain gate: a host callback on the paused execution (a
 	// writer, Stringer, or conversion hook calling back with a context)
-	// must not wait for the gate its own outer evaluation holds. Zombies do
-	// not bypass (see acquireExecution).
-	if token, ok := innermostExecutionToken(interp); ok && !token.zombie {
+	// must not wait for the gate its own outer evaluation holds. Canceled
+	// (zombie) workers do not bypass — see executionMayReenter.
+	if executionMayReenter(interp) {
 		return func() {}, nil
 	}
 	select {
@@ -951,12 +997,10 @@ func (interp *Interpreter) acquireExecutionWithContext(ctx context.Context) (fun
 type executionToken struct {
 	interp *Interpreter
 	depth  int
-	// zombie marks a token whose execution was canceled and whose goroutine
-	// is now unwinding deferred calls after the API call returned, i.e.
-	// running outside the gate's protection. A zombie must not bypass the
-	// gate: its nested Eval would run concurrently with the gated execution
-	// that now holds it.
-	zombie bool
+	// owner is the execution's cancellation channel, read live by
+	// executionMayReenter: once the owner fires, the goroutine is unwinding
+	// outside the gate and must stop bypassing it.
+	owner <-chan struct{}
 }
 
 type executionTokenStack struct {
@@ -994,7 +1038,7 @@ func currentGoroutineID() int {
 // so the outer execution's bypass survives the inner release. A goroutine
 // never pops more than it pushed: every acquisition is released by a defer
 // in the same function of the same goroutine.
-func acquireExecutionToken(interp *Interpreter) {
+func acquireExecutionToken(interp *Interpreter, owner <-chan struct{}) {
 	id := currentGoroutineID()
 	if id == 0 {
 		return
@@ -1005,7 +1049,7 @@ func acquireExecutionToken(interp *Interpreter) {
 		stack.stack[n-1].depth++
 		return
 	}
-	stack.stack = append(stack.stack, &executionToken{interp: interp, depth: 1})
+	stack.stack = append(stack.stack, &executionToken{interp: interp, depth: 1, owner: owner})
 }
 
 func releaseExecutionToken(interp *Interpreter) {
@@ -1048,16 +1092,7 @@ func innermostExecutionToken(interp *Interpreter) (*executionToken, bool) {
 	return stack.stack[len(stack.stack)-1], true
 }
 
-// markExecutionZombie flags the calling goroutine's innermost token for
-// interp as a canceled-worker drain. Called when a canceled execution's
-// runCfg starts unwinding deferred calls: from that point the goroutine runs
-// outside the gate, so its nested Evals must wait instead of bypassing.
-// Same-goroutine ordering makes the plain bool race-free.
-func markExecutionZombie(interp *Interpreter) {
-	if token, ok := innermostExecutionToken(interp); ok {
-		token.zombie = true
-	}
-}
+
 
 // Eval evaluates Go code represented as a string. Eval returns the last result
 // computed by the interpreter, and a non nil error in case of failure.

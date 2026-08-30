@@ -244,7 +244,7 @@ func (interp *Interpreter) executeWithPublication(p *Program, cancel <-chan stru
 	// callback can re-enter the interpreter without waiting on the gate,
 	// while Evals from unrelated goroutines (including `go`-statement
 	// goroutines) still wait.
-	acquireExecutionToken(interp)
+	acquireExecutionToken(interp, cancel)
 	defer releaseExecutionToken(interp)
 	// Compiler state, generated global wiring, and global-frame resizing share
 	// scopes and type tables. Keep them in one short serialized setup phase;

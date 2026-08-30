@@ -419,11 +419,6 @@ func runCfg(n *node, f *frame, funcNode, callNode *node) {
 			f.interp.funcSweepMu.Lock()
 			if zombiePhase {
 				f.interp.zombieDefers.Add(1)
-				// From here this goroutine unwinds deferred calls outside the
-				// gate, so its reentrancy token must stop bypassing the gate:
-				// a nested Eval of the drain would otherwise rewrite the live
-				// root's owner concurrently with the gated execution.
-				markExecutionZombie(f.interp)
 			}
 			if len(deferred) > 0 {
 				f.interp.frameDrains.Add(1)
@@ -440,6 +435,19 @@ func runCfg(n *node, f *frame, funcNode, callNode *node) {
 				}
 			}()
 			for _, deferredCall := range deferred {
+				// Cancellation can land while this drain is parked inside an
+				// earlier deferred host call — after the one-shot zombiePhase
+				// sample above. Re-sample at every deferred-call boundary:
+				// once the root's owner has fired, the remaining interpreted
+				// deferred steps must hold the exclusive fence (zombieDefers)
+				// and the nested gate bypass is refused live via the token's
+				// owner channel.
+				if !zombiePhase && f.root != nil && f.root.canceled() {
+					zombiePhase = true
+					f.interp.funcSweepMu.Lock()
+					f.interp.zombieDefers.Add(1)
+					f.interp.funcSweepMu.Unlock()
+				}
 				val := deferredCall.values
 				func() {
 					defer func() {
