@@ -2,6 +2,7 @@ package interp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -125,7 +126,7 @@ type frame struct {
 	deferred       []deferredCall             // defer stack
 	recovered      interface{}                // to handle panic recover
 	done           reflect.SelectCase         // for cancellation of channel operations
-	cancel         <-chan struct{}            // immutable cancellation owner for this execution
+	cancel         <-chan struct{}            // cancellation owner for this execution; the shared root's field is rewritten by prepareExecutionFrame under mutex, so shared-root reads must take the read lock (see canceled). Every other frame's cancel is copied once by newFrame/clone under the parent's lock and frozen, so unlocked reads of f.cancel on non-root frames are race-free.
 	fenceExclusive atomic.Bool                // funcSweep fence mode captured at step acquisition
 	funcMeta       []reflect.Value            // interpreted wrappers registered by this activation
 	funcEscape     funcMetaRetention          // how wrappers crossed an opaque activation boundary
@@ -328,8 +329,14 @@ func newFrame(anc *frame, length int, id uint64) *frame {
 		f.root = f
 	} else {
 		f.interp = anc.interp
+		// The owner of a shared root can be rewritten by a later evaluation
+		// (prepareExecutionFrame); copy it under the root's lock so a frame
+		// created by an orphaned goroutine (a deferred call unwinding after
+		// cancellation) cannot race that rewrite.
+		anc.mutex.RLock()
 		f.done = anc.done
 		f.cancel = anc.cancel
+		anc.mutex.RUnlock()
 		f.root = anc.root
 	}
 	return f
@@ -338,11 +345,19 @@ func newFrame(anc *frame, length int, id uint64) *frame {
 func (f *frame) runid() uint64      { return atomic.LoadUint64(&f.id) }
 func (f *frame) setrunid(id uint64) { atomic.StoreUint64(&f.id, id) }
 func (f *frame) canceled() bool {
-	if f.cancel == nil {
+	// The cancellation owner of a shared root is rewritten by
+	// prepareExecutionFrame under f.mutex, while interpreted goroutines that
+	// outlive their evaluation (a `go` statement, a canceled worker draining
+	// its deferred calls) keep reading it without any other synchronization.
+	// Take the read lock so those reads cannot race the rewrite.
+	f.mutex.RLock()
+	cancel := f.cancel
+	f.mutex.RUnlock()
+	if cancel == nil {
 		return false
 	}
 	select {
-	case <-f.cancel:
+	case <-cancel:
 		return true
 	default:
 		return false
@@ -374,6 +389,11 @@ func (f *frame) clone() *frame {
 // for lexical closures, this clone must not allow the abandoned activation to
 // write through into the later root.
 func (f *frame) cloneDetached(cancel <-chan struct{}) *frame {
+	// Locking note: this function holds f.mutex.RLock while the cloner takes
+	// funcMu.RLock, the reverse of snapshotFuncMetaCapture's funcMu.RLock ->
+	// capture.frame.mutex.RLock order. Both nestings are read-held today and
+	// no funcMu writer acquires a frame mutex (or vice versa), so no cycle is
+	// reachable; preserve that property when touching either lock section.
 	f.mutex.RLock()
 	nf := &frame{
 		anc:    f.anc,
@@ -497,6 +517,13 @@ type Interpreter struct {
 	// call to relinquish ownership before a native call returns. A later run can
 	// then detach the canceled root without sharing its mutable cancel owner.
 	executionGate chan struct{}
+	// gateHolderGoid is the goroutine id of the goroutine that currently
+	// holds executionGate (0 when free). The holder may always re-enter its
+	// own interpreter: a nested Eval from a host callback of an inline
+	// execution — including a source-package init retry whose ambient
+	// cancellation owner already fired — must not block on the gate its own
+	// goroutine holds.
+	gateHolderGoid atomic.Int64
 	// zombieBarrier serializes the deferred phase of a canceled (zombie)
 	// worker against the whole execution of a later evaluation. A canceled
 	// worker's deferred calls still run (they drive ownership publication),
@@ -884,67 +911,190 @@ func (interp *Interpreter) resizeFrameTo(f *frame) {
 func (interp *Interpreter) acquireExecution() func() {
 	select {
 	case <-interp.executionGate:
-		return func() { interp.executionGate <- struct{}{} }
+		id := currentGoroutineID()
+		interp.gateHolderGoid.Store(int64(id))
+		return func() {
+			interp.gateHolderGoid.CompareAndSwap(int64(id), 0)
+			interp.executionGate <- struct{}{}
+		}
 	default:
-		if executionIsReentrant() {
+		if executionMayReenter(interp) {
 			// Writers, Stringers, and conversion hooks may synchronously call
-			// back into the same interpreter. The outer runCfg frame proves this
-			// call is on that paused execution stack rather than an unrelated
-			// goroutine, so it can inherit the active root and cancel owner.
+			// back into the same interpreter. This goroutine either holds the
+			// gate itself or runs a live (not canceled) execution (it carries
+			// the reentrancy token), so it can inherit the active root and
+			// cancel owner. A canceled worker draining deferred calls after
+			// the API call returned runs outside the gate and must not
+			// bypass: its prepareExecutionFrame would rewrite the live
+			// root's owner concurrently with the gated execution now holding
+			// the gate.
 			return func() {}
 		}
 		<-interp.executionGate
-		return func() { interp.executionGate <- struct{}{} }
+		id := currentGoroutineID()
+		interp.gateHolderGoid.Store(int64(id))
+		return func() {
+			interp.gateHolderGoid.CompareAndSwap(int64(id), 0)
+			interp.executionGate <- struct{}{}
+		}
+	}
+}
+
+// executionMayReenter decides the gate bypass for the calling goroutine. It
+// holds when the goroutine itself holds the execution gate, or when it runs
+// a token whose execution owner is still live. The owner is read at decision
+// time, not sampled once when the execution unwinds: a cancellation that
+// lands while the goroutine is parked inside a deferred host call must
+// remove the bypass for the rest of the drain, so a sampled flag would be a
+// TOCTOU hole.
+func executionMayReenter(interp *Interpreter) bool {
+	id := currentGoroutineID()
+	if id != 0 && interp.gateHolderGoid.Load() == int64(id) {
+		return true
+	}
+	token, ok := innermostExecutionToken(interp)
+	if !ok {
+		return false
+	}
+	return token.owner == nil || !ownerCanceled(token.owner)
+}
+
+func ownerCanceled(cancel <-chan struct{}) bool {
+	select {
+	case <-cancel:
+		return true
+	default:
+		return false
 	}
 }
 
 func (interp *Interpreter) acquireExecutionWithContext(ctx context.Context) (func(), error) {
 	// Mirror the plain gate: a host callback on the paused execution (a
 	// writer, Stringer, or conversion hook calling back with a context)
-	// must not wait for the gate its own outer evaluation holds.
-	if executionIsReentrant() {
+	// must not wait for the gate its own outer evaluation holds. Canceled
+	// (zombie) workers do not bypass — see executionMayReenter.
+	if executionMayReenter(interp) {
 		return func() {}, nil
 	}
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-interp.executionGate:
-		return func() { interp.executionGate <- struct{}{} }, nil
+		id := currentGoroutineID()
+		interp.gateHolderGoid.Store(int64(id))
+		return func() {
+			interp.gateHolderGoid.CompareAndSwap(int64(id), 0)
+			interp.executionGate <- struct{}{}
+		}, nil
 	}
 }
 
-func executionIsReentrant() bool {
-	target := runtime.FuncForPC(reflect.ValueOf(runCfg).Pointer())
-	if target == nil {
-		return false
+// executionToken records that a goroutine is running one interpreter
+// execution. The reentrancy bypass for the execution gate is scoped to the
+// goroutine, not probed from the native stack: any goroutine running
+// interpreted code has runCfg on its stack, including goroutines spawned by
+// an interpreted `go` statement, so a stack probe misreads an Eval from such
+// a goroutine as reentrant and lets it run concurrently with the gated
+// execution. With an explicit token, a host callback running synchronously
+// on the execution's goroutine (a writer, Stringer, or conversion hook) is
+// recognized at any native depth, while an Eval from a `go`-statement
+// goroutine waits for the gate like any unrelated goroutine.
+type executionToken struct {
+	interp *Interpreter
+	depth  int
+	// owner is the execution's cancellation channel, read live by
+	// executionMayReenter: once the owner fires, the goroutine is unwinding
+	// outside the gate and must stop bypassing it.
+	owner <-chan struct{}
+}
+
+type executionTokenStack struct {
+	stack []*executionToken
+}
+
+var executionTokens sync.Map // goroutine id (int) -> *executionTokenStack
+
+// currentGoroutineID extracts the running goroutine's id from its own
+// stack dump header ("goroutine N [running]:"). Only execution entry points
+// and the gate's contended path call this, never per-step code.
+func currentGoroutineID() int {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	line := buf[:n]
+	const prefix = "goroutine "
+	if !bytes.HasPrefix(line, []byte(prefix)) {
+		return 0
 	}
-	// A host callback invoked from interpreted code can sit under an
-	// arbitrarily deep native stack (recursive marshaling, comparison or
-	// rendering code). A truncated walk would mistake a reentrant Eval on
-	// the paused execution for an unrelated goroutine and block forever on
-	// the execution gate, so the scan must cover the whole stack.
-	skip := 2
-	for {
-		pcs := make([]uintptr, 256)
-		count := runtime.Callers(skip, pcs)
-		if count == 0 {
-			return false
-		}
-		frames := runtime.CallersFrames(pcs[:count])
-		for {
-			frame, more := frames.Next()
-			if frame.Function == target.Name() {
-				return true
-			}
-			if !more {
-				break
-			}
-		}
-		if count < len(pcs) {
-			return false
-		}
-		skip += count
+	line = line[len(prefix):]
+	i := bytes.IndexByte(line, ' ')
+	if i < 0 {
+		return 0
 	}
+	id, err := strconv.Atoi(string(line[:i]))
+	if err != nil {
+		return 0
+	}
+	return id
+}
+
+// acquireExecutionToken marks the calling goroutine as running an execution
+// of interp. Nested synchronous re-entry of the same interpreter increments
+// the depth; a call crossing to another interpreter pushes a separate token
+// so the outer execution's bypass survives the inner release. A goroutine
+// never pops more than it pushed: every acquisition is released by a defer
+// in the same function of the same goroutine.
+func acquireExecutionToken(interp *Interpreter, owner <-chan struct{}) {
+	id := currentGoroutineID()
+	if id == 0 {
+		return
+	}
+	entry, _ := executionTokens.LoadOrStore(id, &executionTokenStack{})
+	stack := entry.(*executionTokenStack)
+	if n := len(stack.stack); n > 0 && stack.stack[n-1].interp == interp {
+		stack.stack[n-1].depth++
+		return
+	}
+	stack.stack = append(stack.stack, &executionToken{interp: interp, depth: 1, owner: owner})
+}
+
+func releaseExecutionToken(interp *Interpreter) {
+	id := currentGoroutineID()
+	if id == 0 {
+		return
+	}
+	entry, ok := executionTokens.Load(id)
+	if !ok {
+		return
+	}
+	stack := entry.(*executionTokenStack)
+	if n := len(stack.stack); n > 0 && stack.stack[n-1].interp == interp {
+		stack.stack[n-1].depth--
+		if stack.stack[n-1].depth <= 0 {
+			stack.stack = stack.stack[:len(stack.stack)-1]
+		}
+	}
+	// Goroutine ids are never reused, so an empty stack means this
+	// goroutine is done with executions for good: drop the entry entirely
+	// or a long-lived embedding process leaks one map entry per goroutine
+	// that ever ran an evaluation. The entry is only ever touched by its
+	// owning goroutine, so the delete cannot race another user.
+	if len(stack.stack) == 0 {
+		executionTokens.Delete(id)
+	}
+}
+
+// innermostExecutionToken returns the calling goroutine's innermost token
+// for interp, if any.
+func innermostExecutionToken(interp *Interpreter) (*executionToken, bool) {
+	entry, ok := executionTokens.Load(currentGoroutineID())
+	if !ok {
+		return nil, false
+	}
+	stack := entry.(*executionTokenStack)
+	if len(stack.stack) == 0 || stack.stack[len(stack.stack)-1].interp != interp {
+		return nil, false
+	}
+	return stack.stack[len(stack.stack)-1], true
 }
 
 // Eval evaluates Go code represented as a string. Eval returns the last result
@@ -953,7 +1103,19 @@ func executionIsReentrant() bool {
 // Evaluations on the same interpreter are serialized: an Eval blocked in
 // interpreted code (for example a channel receive) prevents later Evals from
 // starting until it completes. Use EvalWithContext to bound or cancel a
-// blocking evaluation.
+// blocking evaluation. An Eval issued from a host callback running
+// synchronously on the paused execution's goroutine (a writer, a Stringer,
+// or a conversion hook) is recognized as reentrant and does not wait, at any
+// native call depth. Goroutines that run interpreted code outside an
+// evaluation's goroutine — goroutines spawned by an interpreted `go`
+// statement, and host goroutines invoking retained interpreted function
+// values — hold no token: an Eval from them waits for the gate like any
+// unrelated goroutine, instead of running concurrently with the gated
+// execution. If the gated evaluation is transitively waiting on such a
+// goroutine (for example through a channel handshake), that wait is a
+// user-level deadlock, exactly like blocking on an already-held mutex in
+// Go; earlier versions bypassed the gate in this situation and raced the
+// running evaluation instead.
 func (interp *Interpreter) Eval(src string) (res reflect.Value, err error) {
 	release := interp.acquireExecution()
 	defer release()
@@ -1150,7 +1312,14 @@ func ignoreScannerError(e *scanner.Error, s string) bool {
 // constructed by replacing the last "/" by a "_", producing crypto_rand and math_rand.
 // ImportUsed should not be called more than once, and not after a first Eval, as it may
 // rename packages.
+//
+// ImportUsed mutates the interpreter symbol tables, so it is serialized with
+// evaluations on the same interpreter like Eval: it waits for an in-flight
+// evaluation to complete, and a host callback of a paused evaluation is
+// recognized as reentrant.
 func (interp *Interpreter) ImportUsed() {
+	release := interp.acquireExecution()
+	defer release()
 	sc := interp.universe
 	for k := range interp.binPkg {
 		// By construction, the package name is the last path element of the key.

@@ -254,7 +254,12 @@ func (interp *Interpreter) run(n *node, cf *frame) {
 	}
 	var f *frame
 	if cf == nil {
+		// No in-tree caller passes a nil frame, but read interp.frame under
+		// its mutex so a future caller cannot race prepareExecutionFrame's
+		// root replacement.
+		interp.mutex.RLock()
 		f = interp.frame
+		interp.mutex.RUnlock()
 	} else {
 		f = newFrame(cf, len(n.types), cf.runid())
 	}
@@ -430,6 +435,19 @@ func runCfg(n *node, f *frame, funcNode, callNode *node) {
 				}
 			}()
 			for _, deferredCall := range deferred {
+				// Cancellation can land while this drain is parked inside an
+				// earlier deferred host call — after the one-shot zombiePhase
+				// sample above. Re-sample at every deferred-call boundary:
+				// once the root's owner has fired, the remaining interpreted
+				// deferred steps must hold the exclusive fence (zombieDefers)
+				// and the nested gate bypass is refused live via the token's
+				// owner channel.
+				if !zombiePhase && f.root != nil && f.root.canceled() {
+					zombiePhase = true
+					f.interp.funcSweepMu.Lock()
+					f.interp.zombieDefers.Add(1)
+					f.interp.funcSweepMu.Unlock()
+				}
 				val := deferredCall.values
 				func() {
 					defer func() {
@@ -4699,8 +4717,11 @@ func recv(n *node) {
 		if n.fnext != nil {
 			fnext := getExec(n.fnext)
 			n.exec = func(f *frame) bltn {
-				if r, _ := recvWithFuncSweepFenceReleased(f, value(f)); r.Bool() {
-					getFrame(f, l).data[i] = r
+				ch := value(f)
+				r, _ := recvWithFuncSweepFenceReleased(f, ch)
+				r = f.interp.adoptInterpretedFuncValue(f, ch, r)
+				store(f, r)
+				if r.Bool() {
 					return tnext
 				}
 				return fnext

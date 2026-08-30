@@ -111,7 +111,17 @@ func getWrapper(n *node, t reflect.Type) reflect.Type {
 
 // Use loads binary runtime symbols in the interpreter context so
 // they can be used in interpreted code.
+//
+// Use mutates the interpreter package tables, so it is serialized with
+// evaluations on the same interpreter like Eval: it waits for an in-flight
+// evaluation to complete, and a host callback of a paused evaluation is
+// recognized as reentrant.
 func (interp *Interpreter) Use(values Exports) error {
+	// The gate is held for the whole call; the generic-source compiles below
+	// use the internal compile entry point because the public Compile would
+	// wait for this very gate.
+	release := interp.acquireExecution()
+	defer release()
 	for k, v := range values {
 		importPath := path.Dir(k)
 		packageName := path.Base(k)
@@ -151,9 +161,11 @@ func (interp *Interpreter) Use(values Exports) error {
 	if _, ok := values["fmt/fmt"]; ok {
 		fixStdlib(interp)
 
-		// Load stdlib generic source.
+		// Load stdlib generic source. Use interp.compileSrc, not the public
+		// Compile: the execution gate is already held by this call, and the
+		// public entry point would wait for it.
 		for _, s := range gen.Sources {
-			if _, err := interp.Compile(s); err != nil {
+			if _, err := interp.compileSrc(s, "", true); err != nil {
 				return err
 			}
 		}

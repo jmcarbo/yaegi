@@ -287,6 +287,14 @@ func (interp *Interpreter) rollbackSourcePackageBuildLocked(importPath string, b
 // cancellation or panic cannot become the package's committed state.
 func (interp *Interpreter) runSourcePackageInitLocked(prepared *sourcePackageInit) (string, error) {
 	compileOwner := interp.compileCancel
+	// Source-package initialization runs interpreted steps on this
+	// goroutine; mark it like executeWithPublication so a synchronous host
+	// callback of the initializer can re-enter the interpreter. The ambient
+	// compile owner is the token's liveness owner: a retry whose owner
+	// already fired still runs on the gate-holding goroutine, so the
+	// gate-holder rule keeps its reentrancy.
+	acquireExecutionToken(interp, compileOwner)
+	defer releaseExecutionToken(interp)
 	if prepared.phase == sourcePackageFailed && prepared.failedRoot != nil {
 		// The detach reads live cells of the failed root, whose canceled
 		// worker may still be unwinding deferred calls. Detach under the
