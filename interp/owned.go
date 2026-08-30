@@ -2335,6 +2335,16 @@ func (interp *Interpreter) sweepRootOwnedObjects(root *frame) {
 	}
 	interp.funcSweepMu.Lock()
 	defer interp.funcSweepMu.Unlock()
+	interp.sweepRootOwnedObjectsLocked(root)
+}
+
+// sweepRootOwnedObjectsLocked is the body of sweepRootOwnedObjects for callers
+// which already hold the exclusive funcSweepMu fence, such as
+// PurgeRetainedFuncs. The caller must not hold funcMu: the body acquires it.
+func (interp *Interpreter) sweepRootOwnedObjectsLocked(root *frame) {
+	if root == nil {
+		return
+	}
 	values := interp.snapshotOwnedReachabilityValues(root)
 	interp.funcMu.Lock()
 	defer interp.funcMu.Unlock()

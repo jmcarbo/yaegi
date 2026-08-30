@@ -182,6 +182,13 @@ func (interp *Interpreter) rollbackInterpretedFuncPanicEscape(recovered interfac
 		return
 	}
 	reflected := reflect.ValueOf(value)
+	collector := newFuncValueCollector()
+	if funcBearingValue(reflected) {
+		collector.collect(reflected)
+	}
+	if len(collector.exact) == 0 {
+		return
+	}
 	interp.funcMu.RLock()
 	entries := make(map[reflect.Value]interpretedFuncMeta, len(interp.funcMeta))
 	for key, meta := range interp.funcMeta {
@@ -190,8 +197,7 @@ func (interp *Interpreter) rollbackInterpretedFuncPanicEscape(recovered interfac
 	interp.funcMu.RUnlock()
 	groups := map[*funcMetaGroup]struct{}{}
 	for key, meta := range entries {
-		visitor := funcValueVisitor{targets: map[reflect.Value]struct{}{key: {}}}
-		if visitor.contains(reflected) {
+		if collector.exactContains(key) {
 			groups[meta.group] = struct{}{}
 		}
 	}
@@ -212,6 +218,17 @@ func (interp *Interpreter) rollbackInterpretedFuncPanicEscape(recovered interfac
 }
 
 func (interp *Interpreter) markInterpretedFuncMetadataEscapedLocked(retention funcMetaRetention, values ...reflect.Value) {
+	collector := newFuncValueCollector()
+	for _, value := range values {
+		if !funcBearingValue(value) {
+			continue
+		}
+		collector.collect(value)
+	}
+	if len(collector.exact) == 0 {
+		return
+	}
+
 	interp.funcMu.RLock()
 	entries := make(map[reflect.Value]interpretedFuncMeta, len(interp.funcMeta))
 	for key, meta := range interp.funcMeta {
@@ -221,12 +238,8 @@ func (interp *Interpreter) markInterpretedFuncMetadataEscapedLocked(retention fu
 
 	escaped := map[reflect.Value]struct{}{}
 	for key := range entries {
-		visitor := funcValueVisitor{targets: map[reflect.Value]struct{}{key: {}}}
-		for _, value := range values {
-			if visitor.contains(value) {
-				escaped[key] = struct{}{}
-				break
-			}
+		if collector.exactContains(key) {
+			escaped[key] = struct{}{}
 		}
 	}
 	if len(escaped) == 0 {
@@ -604,7 +617,7 @@ func (interp *Interpreter) preserveReturnedInterpretedFuncs(value reflect.Value)
 }
 
 func (interp *Interpreter) preserveReturnedInterpretedFuncsLocked(value reflect.Value) {
-	if !value.IsValid() {
+	if !funcBearingValue(value) {
 		return
 	}
 	interp.funcMu.RLock()
@@ -614,10 +627,11 @@ func (interp *Interpreter) preserveReturnedInterpretedFuncsLocked(value reflect.
 	}
 	interp.funcMu.RUnlock()
 
+	collector := newFuncValueCollector()
+	collector.collect(value)
 	groups := map[*funcMetaGroup]struct{}{}
 	for key, meta := range entries {
-		visitor := funcValueVisitor{targets: map[reflect.Value]struct{}{key: {}}}
-		if visitor.contains(value) {
+		if collector.exactContains(key) {
 			groups[meta.group] = struct{}{}
 		}
 	}
@@ -676,11 +690,7 @@ func (interp *Interpreter) snapshotGlobalVarIndexes() map[int]struct{} {
 // results cannot contain callbacks. For a function-bearing result, retain the
 // visible groups because the host may keep a wrapper after this Eval returns.
 func (interp *Interpreter) preservePossiblyReturnedInterpretedFuncs(result reflect.Value) {
-	if !result.IsValid() {
-		return
-	}
-	typ := result.Type()
-	if typ != valueInterfaceType && typ != reflect.TypeOf(reflect.Value{}) && !typeMayContainFunc(typ, map[reflect.Type]bool{}) {
+	if !funcBearingValue(result) {
 		return
 	}
 	interp.funcMu.Lock()
@@ -691,6 +701,213 @@ func (interp *Interpreter) preservePossiblyReturnedInterpretedFuncs(result refle
 		}
 	}
 	interp.funcMu.Unlock()
+}
+
+// PurgeRetainedFuncs removes escape metadata retained for function values
+// which crossed the Eval API (as results, channel sends, or panics) and are no
+// longer reachable from package-level variables. It returns the number of
+// metadata entries removed and is idempotent.
+//
+// Experimental. Values reachable from package-level variables are never
+// purged and keep re-binding. A purged value remains callable (a self-contained
+// MakeFunc wrapper) but permanently executes against its original root: after
+// a later cancel/detach its writes land in the abandoned root and lose
+// channel-ownership tracking.
+//
+// WARNING: do not call from interpreted code, from a host callback of a
+// running evaluation, or while paused under the debugger. Called from an
+// unrelated goroutine it blocks until evaluations quiesce.
+func (interp *Interpreter) PurgeRetainedFuncs() int {
+	interp.funcSweepMu.Lock()
+	defer interp.funcSweepMu.Unlock()
+
+	interp.mutex.RLock()
+	root := interp.frame
+	interp.mutex.RUnlock()
+
+	// Group-scoped snapshot: lookupInterpretedFunc's convertible-type fallback
+	// would resurrect a key-scoped purge through an alias sharing meta.group,
+	// so candidates, members, and eligibility are tracked per group. Groups
+	// pinned by undelivered channel sends or live panic tokens are skipped.
+	interp.funcMu.RLock()
+	candidates := map[reflect.Value]interpretedFuncMeta{}
+	groupMembers := map[*funcMetaGroup][]reflect.Value{}
+	groupCaptures := map[*funcMetaGroup][]funcMetaCapture{}
+	groupVersions := map[*funcMetaGroup]uint64{}
+	eligible := map[*funcMetaGroup]bool{}
+	for key, meta := range interp.funcMeta {
+		if meta.retention != funcMetaOpaque || meta.frame == nil {
+			continue
+		}
+		candidates[key] = meta
+		groupMembers[meta.group] = append(groupMembers[meta.group], key)
+		if _, seen := groupVersions[meta.group]; seen {
+			continue
+		}
+		groupVersions[meta.group] = 0
+		if meta.group != nil {
+			groupVersions[meta.group] = meta.group.version
+			groupCaptures[meta.group] = append([]funcMetaCapture(nil), meta.group.captures...)
+			eligible[meta.group] = meta.group.pending == 0 && len(meta.group.panicTokens) == 0
+		} else {
+			eligible[meta.group] = true
+		}
+	}
+	// A group referenced by a send which has not reached a terminal state must
+	// stay pinned until the value is delivered or the send is retired.
+	for _, channel := range interp.ownedChannels {
+		for _, send := range channel.sends {
+			if send.state == ownedChannelSendTerminal {
+				continue
+			}
+			for group := range send.groups {
+				eligible[group] = false
+			}
+			for group := range send.pendingGroups {
+				eligible[group] = false
+			}
+		}
+	}
+	interp.funcMu.RUnlock()
+	if len(candidates) == 0 {
+		return 0
+	}
+
+	// Anchors: the durable global cells of the current root. directFuncs
+	// activations are deliberately not anchors — they are a private clone
+	// cache, not a package-level variable, and would otherwise keep a dropped
+	// wrapper's clone group alive forever.
+	indexes := interp.snapshotGlobalVarIndexes()
+	root.mutex.RLock()
+	values := make([]reflect.Value, 0, len(indexes))
+	for index := range indexes {
+		if index < len(root.data) {
+			values = append(values, root.data[index])
+		}
+	}
+	root.mutex.RUnlock()
+
+	collector := newFuncValueCollector()
+	for _, value := range values {
+		collector.collect(value)
+		if collector.anyAmbiguous {
+			break
+		}
+	}
+	liveGroups := map[*funcMetaGroup]struct{}{}
+	if collector.anyAmbiguous {
+		for group := range groupVersions {
+			liveGroups[group] = struct{}{}
+		}
+	} else {
+		for key, meta := range candidates {
+			if collector.exactContains(key) {
+				liveGroups[meta.group] = struct{}{}
+			}
+		}
+		// One reachable closure can itself capture another wrapper opaquely;
+		// close over the captured cells until the live set stops growing.
+		for changed := true; changed && !collector.anyAmbiguous; {
+			changed = false
+			for group := range liveGroups {
+				for _, capture := range groupCaptures[group] {
+					value, ok := snapshotFuncMetaCapture(capture)
+					if !ok {
+						continue
+					}
+					collector.collect(value)
+					if collector.anyAmbiguous {
+						for candidateGroup := range groupVersions {
+							liveGroups[candidateGroup] = struct{}{}
+						}
+						changed = false
+						break
+					}
+					for key, meta := range candidates {
+						if _, live := liveGroups[meta.group]; live {
+							continue
+						}
+						if collector.exactContains(key) {
+							liveGroups[meta.group] = struct{}{}
+							changed = true
+						}
+					}
+				}
+				if collector.anyAmbiguous {
+					break
+				}
+			}
+		}
+	}
+
+	removed := 0
+	deletedKeys := map[reflect.Value]struct{}{}
+	affectedFrames := map[*frame]struct{}{}
+	interp.funcMu.Lock()
+	for group, isEligible := range eligible {
+		if !isEligible {
+			continue
+		}
+		if _, live := liveGroups[group]; live {
+			continue
+		}
+		if group != nil && group.version != groupVersions[group] {
+			// The group captured or registered members after the snapshot;
+			// leave it intact rather than splitting an alias group.
+			continue
+		}
+		for _, key := range groupMembers[group] {
+			meta, ok := interp.funcMeta[key]
+			if !ok || meta.group != group || meta.retention != funcMetaOpaque || meta.frame == nil {
+				continue
+			}
+			delete(interp.funcMeta, key)
+			deletedKeys[key] = struct{}{}
+			removed++
+			affectedFrames[meta.frame] = struct{}{}
+		}
+	}
+	// Drop directFuncs activations whose source or cloned value lost its
+	// metadata: such an entry can never again resolve to discoverable
+	// metadata, and keeping either endpoint would anchor the other forever.
+	for key, value := range interp.directFuncs {
+		valueKey, ok := canonicalFuncValue(value)
+		if !ok {
+			continue
+		}
+		if _, deleted := deletedKeys[key.source]; !deleted {
+			if _, deleted := deletedKeys[valueKey]; !deleted {
+				continue
+			}
+		}
+		delete(interp.directFuncs, key)
+	}
+	for affected := range affectedFrames {
+		affected.funcMeta = affected.funcMeta[:0]
+		for key, meta := range interp.funcMeta {
+			if meta.frame == affected {
+				affected.funcMeta = append(affected.funcMeta, key)
+			}
+		}
+	}
+	interp.funcMu.Unlock()
+
+	if removed == 0 {
+		return 0
+	}
+	// Captures may have been pinned only by frames whose metadata this purge
+	// deleted; re-run the owned-object sweep per affected root generation to
+	// release them. unregisterOwnedObjectLocked keeps hostSharedEstimate exact.
+	affectedRoots := map[*frame]struct{}{}
+	for affected := range affectedFrames {
+		if affected.root != nil {
+			affectedRoots[affected.root] = struct{}{}
+		}
+	}
+	for affectedRoot := range affectedRoots {
+		interp.sweepRootOwnedObjectsLocked(affectedRoot)
+	}
+	return removed
 }
 
 // sweepRootInterpretedFuncs removes only interpreter-visible root metadata.
@@ -759,13 +976,25 @@ func (interp *Interpreter) sweepRootInterpretedFuncs(root *frame, result reflect
 	root.mutex.RUnlock()
 	values = append(values, directValues...)
 
+	// One walk of the seed values replaces one containment walk per candidate.
+	// An ambiguous func-capable container keeps every candidate alive, matching
+	// funcValueVisitor's ptr/slice/map ambiguity rules.
+	collector := newFuncValueCollector()
+	for _, value := range values {
+		collector.collect(value)
+		if collector.anyAmbiguous {
+			break
+		}
+	}
 	liveGroups := map[*funcMetaGroup]struct{}{}
-	for key, meta := range candidates {
-		visitor := funcValueVisitor{targets: map[reflect.Value]struct{}{key: {}}}
-		for _, value := range values {
-			if visitor.possiblyContains(value) {
+	if collector.anyAmbiguous {
+		for _, meta := range candidates {
+			liveGroups[meta.group] = struct{}{}
+		}
+	} else {
+		for key, meta := range candidates {
+			if collector.exactContains(key) {
 				liveGroups[meta.group] = struct{}{}
-				break
 			}
 		}
 	}
@@ -1034,4 +1263,106 @@ func typeMayContainFunc(typ reflect.Type, seen map[reflect.Type]bool) bool {
 		}
 	}
 	return false
+}
+
+// funcBearingValue reports whether a value's static type may hide a function.
+// The boxed value wrappers must always be walked: their content is untyped at
+// the call boundary even though their struct fields contain no function type.
+func funcBearingValue(value reflect.Value) bool {
+	if !value.IsValid() {
+		return false
+	}
+	typ := value.Type()
+	if typ == valueInterfaceType || typ == reflectedValueType {
+		return true
+	}
+	return typeMayContainFunc(typ, map[reflect.Type]bool{})
+}
+
+// funcValueCollector gathers the exact canonical function values reachable
+// through a value graph and records whether an ambiguous func-capable
+// container was crossed. Traversal mirrors funcValueVisitor.match: boxed and
+// interface values are unwrapped, structs and arrays are descended when their
+// type may contain a function, and non-nil pointers, slices, and maps are
+// never read recursively (native code may retain and mutate them while an
+// interpreted call is canceled), so they only set anyAmbiguous.
+type funcValueCollector struct {
+	exact        map[reflect.Value]struct{}
+	anyAmbiguous bool
+}
+
+func newFuncValueCollector() *funcValueCollector {
+	return &funcValueCollector{exact: map[reflect.Value]struct{}{}}
+}
+
+// exactContains reports whether the canonical function value key was found in
+// the collected graph. A candidate is live iff exactContains or anyAmbiguous,
+// which reproduces funcValueVisitor.possiblyContains.
+func (c *funcValueCollector) exactContains(key reflect.Value) bool {
+	_, ok := c.exact[key]
+	return ok
+}
+
+func (c *funcValueCollector) collect(value reflect.Value) {
+	if !value.IsValid() {
+		return
+	}
+	if value.CanInterface() {
+		switch wrapped := value.Interface().(type) {
+		case valueInterface:
+			c.collect(wrapped.value)
+			return
+		case reflect.Value:
+			c.collect(wrapped)
+			return
+		}
+	}
+
+	switch value.Kind() {
+	case reflect.Func:
+		if value.IsNil() {
+			return
+		}
+		key, ok := canonicalFuncValue(value)
+		if !ok {
+			c.anyAmbiguous = true
+			return
+		}
+		c.exact[key] = struct{}{}
+	case reflect.Interface:
+		if value.IsNil() {
+			return
+		}
+		c.collect(value.Elem())
+	case reflect.Ptr:
+		if value.IsNil() || !typeMayContainFunc(value.Type().Elem(), map[reflect.Type]bool{}) {
+			return
+		}
+		c.anyAmbiguous = true
+	case reflect.Struct:
+		if !typeMayContainFunc(value.Type(), map[reflect.Type]bool{}) {
+			return
+		}
+		for i := 0; i < value.NumField(); i++ {
+			c.collect(value.Field(i))
+		}
+	case reflect.Array:
+		if !typeMayContainFunc(value.Type().Elem(), map[reflect.Type]bool{}) {
+			return
+		}
+		for i := 0; i < value.Len(); i++ {
+			c.collect(value.Index(i))
+		}
+	case reflect.Slice:
+		if value.IsNil() || !typeMayContainFunc(value.Type().Elem(), map[reflect.Type]bool{}) {
+			return
+		}
+		c.anyAmbiguous = true
+	case reflect.Map:
+		if value.IsNil() || (!typeMayContainFunc(value.Type().Key(), map[reflect.Type]bool{}) &&
+			!typeMayContainFunc(value.Type().Elem(), map[reflect.Type]bool{})) {
+			return
+		}
+		c.anyAmbiguous = true
+	}
 }
