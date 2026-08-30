@@ -254,7 +254,12 @@ func (interp *Interpreter) run(n *node, cf *frame) {
 	}
 	var f *frame
 	if cf == nil {
+		// No in-tree caller passes a nil frame, but read interp.frame under
+		// its mutex so a future caller cannot race prepareExecutionFrame's
+		// root replacement.
+		interp.mutex.RLock()
 		f = interp.frame
+		interp.mutex.RUnlock()
 	} else {
 		f = newFrame(cf, len(n.types), cf.runid())
 	}
@@ -414,6 +419,11 @@ func runCfg(n *node, f *frame, funcNode, callNode *node) {
 			f.interp.funcSweepMu.Lock()
 			if zombiePhase {
 				f.interp.zombieDefers.Add(1)
+				// From here this goroutine unwinds deferred calls outside the
+				// gate, so its reentrancy token must stop bypassing the gate:
+				// a nested Eval of the drain would otherwise rewrite the live
+				// root's owner concurrently with the gated execution.
+				markExecutionZombie(f.interp)
 			}
 			if len(deferred) > 0 {
 				f.interp.frameDrains.Add(1)

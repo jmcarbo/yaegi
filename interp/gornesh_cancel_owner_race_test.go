@@ -111,7 +111,7 @@ go func() {
 	for time.Now().Before(deadline) {
 		if _, err := i.Eval(`1 + 1`); err != nil {
 			t.Errorf("rewrite eval: %v", err)
-		return
+			return
 		}
 		runtime.Gosched()
 	}
