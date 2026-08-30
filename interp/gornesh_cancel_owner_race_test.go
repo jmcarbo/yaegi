@@ -37,12 +37,15 @@ func TestGorneshCanceledOwnerRewriteRace(t *testing.T) {
 	}
 }
 
+// runCancelOwnerRewriteRound runs on a worker goroutine; it reports
+// failures with t.Errorf (FailNow is only documented for the test
+// goroutine) and returns early instead of calling t.Fatal.
 func runCancelOwnerRewriteRound(t *testing.T) {
-	t.Helper()
 
 	i := interp.New(interp.Options{})
 	if err := i.Use(stdlib.Symbols); err != nil {
-		t.Fatal(err)
+		t.Errorf("use stdlib: %v", err)
+		return
 	}
 
 	entered := make(chan struct{})
@@ -63,7 +66,8 @@ func runCancelOwnerRewriteRound(t *testing.T) {
 			"Done":    reflect.ValueOf(func() { doneOnce.Do(func() { close(done) }) }),
 		},
 	}); err != nil {
-		t.Fatal(err)
+		t.Errorf("use ownerrace: %v", err)
+		return
 	}
 
 	// The orphan goroutine keeps running after Eval has returned. Each
@@ -89,13 +93,15 @@ go func() {
 	_ = sum
 }()
 `); err != nil {
-		t.Fatalf("orphan eval: %v", err)
+		t.Errorf("orphan eval: %v", err)
+		return
 	}
 
 	select {
 	case <-entered:
 	case <-time.After(5 * time.Second):
-		t.Fatal("orphaned goroutine did not start")
+		t.Error("orphaned goroutine did not start")
+		return
 	}
 
 	// Release the orphan's native gate and hammer the owner rewrite
@@ -104,7 +110,8 @@ go func() {
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		if _, err := i.Eval(`1 + 1`); err != nil {
-			t.Fatalf("rewrite eval: %v", err)
+			t.Errorf("rewrite eval: %v", err)
+		return
 		}
 		runtime.Gosched()
 	}
@@ -112,14 +119,17 @@ go func() {
 	// Also rewrite through a context owner, which replaces interp.done with
 	// a fresh per-execution channel before discarding it.
 	ctx, cancel := context.WithCancel(context.Background())
-	if _, err := i.EvalWithContext(ctx, `2 + 2`); err != nil {
-		t.Fatalf("context eval: %v", err)
-	}
+	_, err := i.EvalWithContext(ctx, `2 + 2`)
 	cancel()
+	if err != nil {
+		t.Errorf("context eval: %v", err)
+		return
+	}
 
 	select {
 	case <-done:
 	case <-time.After(60 * time.Second):
-		t.Fatal("orphaned interpreted goroutine did not finish")
+		t.Error("orphaned interpreted goroutine did not finish")
+		return
 	}
 }
