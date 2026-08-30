@@ -18,10 +18,12 @@ import (
 // returned.
 func (interp *Interpreter) Symbols(importPath string) Exports {
 	m := map[string]map[string]reflect.Value{}
+	interp.funcSweepMu.Lock()
+	defer interp.funcSweepMu.Unlock()
 	interp.mutex.RLock()
 	defer interp.mutex.RUnlock()
 
-	for k, v := range interp.srcPkg {
+	for k, v := range interp.publishedSrcPkg {
 		if importPath != "" && k != importPath {
 			continue
 		}
@@ -35,9 +37,16 @@ func (interp *Interpreter) Symbols(importPath string) Exports {
 			case constSym:
 				syms[n] = s.rval
 			case funcSym:
-				syms[n] = genFunctionWrapper(s.node)(interp.frame)
+				value := genFunctionWrapper(s.node)(interp.frame)
+				interp.publishHostValueLocked(value, false)
+				syms[n] = value
 			case varSym:
-				syms[n] = interp.frame.data[s.index]
+				if s.index < 0 || s.index >= len(interp.frame.data) {
+					continue
+				}
+				value := interp.frame.data[s.index]
+				interp.publishHostValueLocked(value, true)
+				syms[n] = value
 			case typeSym:
 				syms[n] = reflect.New(s.typ.TypeOf())
 			}

@@ -14,7 +14,8 @@ func init() {
 		"Symbols": reflect.ValueOf(Symbols),
 	}
 	Symbols["github.com/traefik/yaegi/yaegi"] = map[string]reflect.Value{
-		"convert": reflect.ValueOf(convert),
+		"convert":                    reflect.ValueOf(convert),
+		"convertOwnedUnsafeIdentity": reflect.ValueOf(true),
 	}
 
 	Symbols["unsafe/unsafe"]["Add"] = reflect.ValueOf(add)
