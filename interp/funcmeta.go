@@ -856,6 +856,13 @@ func (interp *Interpreter) PurgeRetainedFuncs() int {
 			// leave it intact rather than splitting an alias group.
 			continue
 		}
+		if group != nil && (group.pending != 0 || len(group.panicTokens) != 0) {
+			// Re-check eligibility under the delete lock: panic-token
+			// memberships attach under funcMu without bumping the version,
+			// so a token attached after the snapshot would otherwise be
+			// missed and a group pinned by a live panic could be purged.
+			continue
+		}
 		for _, key := range groupMembers[group] {
 			meta, ok := interp.funcMeta[key]
 			if !ok || meta.group != group || meta.retention != funcMetaOpaque || meta.frame == nil {

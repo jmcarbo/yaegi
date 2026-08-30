@@ -88,3 +88,33 @@
   into the orphaned map; the same late-resolution question applies to slice
   and pointer-deref destinations. A multi-return call RHS into a map-entry
   destination (m[0], x = f()) also still loses the map write.
+- Bounding the ownership registries cannot skip registration: allocations made
+  before the first cancellation are exactly the ones the first detached-root
+  clone must copy, and unregistered native-looking objects are shared with the
+  canceled worker (16 detached-root isolation and host-shared tests fail under
+  a registration gate). The bound must come from eviction against a root set
+  that is a strict superset of every live consumer: durable globals, every
+  registered active frame's full ancestor chain, all closure captures, and
+  direct funcs. The incremental sweep consumes its trigger at the top of an
+  exec step (no locks held) under a TryLock'ed exclusive fence, and stays
+  pending while any frame is unwinding defers, because deferred-call values
+  are invisible to the root set.
+- Purging retained function metadata must be group-scoped: host-bound aliases
+  share the metadata group, and lookup's convertible-type fallback would
+  resurrect a purged capability through a surviving alias key. Eligibility
+  (pending refcounts, panic tokens, live channel sends) must be re-checked
+  under the delete-phase lock: panic-token memberships attach under funcMu
+  without bumping the group version.
+- A func-bearing-value walk can be inverted from visitor-per-registry-entry
+  into collect-once-then-intersect (exact canonical set + an any-ambiguous
+  flag) with identical results, because pointer/slice/map containers can only
+  ever yield ambiguous matches; this removed the per-Eval quadratic term in
+  accumulated opaque metadata.
+- Known open item: an incremental Eval beginning with `func` permanently adds
+  1-3 global-frame slots on this branch (master adds none) because the
+  anti-replay fix returns the wrapper body, which compiles in global scope
+  where each func literal allocates a persistent slot. Wrapping the body in a
+  one-shot function literal does not help: the literal's own value slot is
+  allocated in the enclosing scope before its function scope is pushed. Sound
+  fixes need codegen for immediately-called literals or a scheduler-level
+  one-shot declaration; both are larger redesigns.

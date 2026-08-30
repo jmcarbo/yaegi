@@ -31,6 +31,29 @@ is a SUPERSET of the existing ones (Eval-end sweep + frame-exit release).
 
 ## F1/F1c remediation — bounded incremental ownership sweep ("ownedGC")
 
+IMPLEMENTED 2026-08-30 (interp/owned.go armOwnedGCLocked/maybeRunOwnedGCSweep/
+ownedGCSweepLocked, interp/run.go execWithFuncSweepFence + runCfg registration,
+interp/program.go prepareExecutionFrame secondary trigger; tests in
+interp/gornesh_owned_gc_internal_test.go). Deviations from the ruling as
+written: (1) the eviction predicate follows the actual sweepRootOwnedObjectsLocked
+body, which does NOT exempt hostShared objects (the `!hostShared` term in the
+paraphrase below does not exist in the code); (2) capture cells are read
+directly under funcMu with the exclusive fence instead of via
+snapshotFuncMetaCapture, which acquires funcMu.RLock (self-deadlock under the
+sweep's funcMu.Lock) and returns a copy that would defeat the interval
+collector's interior-pointer keep-alive; (3) the channel "owner not active"
+predicate keeps only non-root owners with a live activeFrames entry — root-owned
+channels follow the existing sweepRootOwnedChannels semantics (evictable when
+unreachable), which is required for boundedness under top-level churn — and
+channels referenced by non-terminal send values are pinned explicitly, since a
+channel buffered inside another channel is not reflect-traversable; (4) a new
+frameDrains counter (incremented under the exclusive fence in the runCfg exit
+path) gates the whole sweep: a draining frame's remaining deferred call values
+are invisible to the root set, so the sweep stays pending while any drain is
+active. All Gornesh tests, including the 63 detached-root isolation tests,
+pass under -race; the full interp suite matches its pre-existing GOPATH-layout
+failure baseline.
+
 Universal registration preserved; run the same eviction as
 `sweepRootOwnedObjects` incrementally against a complete active-frame root set.
 
@@ -113,13 +136,13 @@ resurrect a key-scoped purge):
    generation), group members (all keys sharing each group), group captures +
    versions; eligibility per group: `pending == 0 && len(panicTokens) == 0 &&
    no non-terminal ownedChannelSend references it`.
-2. Anchors (fence held): current root global cells + directFuncs values.
+2. Anchors (fence held): current root global cells (directFuncs values are deliberately NOT anchors: cloned wrappers get fresh groups and the clone cache holds self-referential entries, which would keep purge non-idempotent; directFuncs entries are instead cleaned by either endpoint matching a deleted key).
    Collect exact canonical func values once; any ambiguous func-capable
    container marks all candidates live. Capture fixpoint via
    snapshotFuncMetaCapture (mirrors sweepRootInterpretedFuncs).
 3. Delete under funcMu.Lock: candidate keys of live groups skipped; deleted
    groups delete ALL member keys (aliases); delete directFuncs entries whose
-   source key was deleted; rebuild each affected root's funcMeta slice
+   source key was deleted; rebuild each affected frame's funcMeta slice
    (template: deleteUnreachableRootFuncMeta ~836-841).
 4. Then re-run the owned-object sweep via a factored
    `sweepRootOwnedObjectsLocked(root)` (split the fence-acquiring wrapper from

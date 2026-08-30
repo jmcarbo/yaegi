@@ -376,10 +376,19 @@ func panicFunc(s *scope) string {
 }
 
 // runCfg executes a node AST by walking its CFG and running node builtin at each step.
+//
+// runCfg is the ONLY frame activation site (call sites: runOnFrame, the
+// declared-function wrapper invoke, the go-statement launch, the interpreted
+// call, and the closure-wrapper invoke), so the activeFrames registration
+// below covers every execution that can touch frame cells.
 func runCfg(n *node, f *frame, funcNode, callNode *node) {
 	var exec bltn
 	f.interp.funcMu.Lock()
 	f.funcState = funcFrameActive
+	// Register the activation for the incremental ownership sweep's root set.
+	// Refcounted: a root frame can re-enter runCfg via a reentrant Eval while
+	// an outer activation on the same frame is still live.
+	f.interp.activeFrames[f]++
 	f.interp.funcMu.Unlock()
 	defer func() {
 		recovered := recover()
@@ -396,13 +405,28 @@ func runCfg(n *node, f *frame, funcNode, callNode *node) {
 		// stretches still release the fence. Only the root's own deferred
 		// section toggles the flag; nested frames unwind inside it.
 		zombiePhase := f.root != nil && f.root.canceled()
-		if zombiePhase {
-			f.interp.zombieDefers.Add(1)
+		// The counters are incremented under the exclusive fence so an
+		// incremental ownedGC sweep holding the fence reads frameDrains
+		// exactly: a draining frame's remaining deferred call values are
+		// invisible to the sweep's root set, so no sweep may run while any
+		// drain is in progress (the sweep re-checks and stays pending).
+		if len(deferred) > 0 || zombiePhase {
+			f.interp.funcSweepMu.Lock()
+			if zombiePhase {
+				f.interp.zombieDefers.Add(1)
+			}
+			if len(deferred) > 0 {
+				f.interp.frameDrains.Add(1)
+			}
+			f.interp.funcSweepMu.Unlock()
 		}
 		func() {
 			defer func() {
 				if zombiePhase {
 					f.interp.zombieDefers.Add(-1)
+				}
+				if len(deferred) > 0 {
+					f.interp.frameDrains.Add(-1)
 				}
 			}()
 			for _, deferredCall := range deferred {
@@ -442,9 +466,27 @@ func runCfg(n *node, f *frame, funcNode, callNode *node) {
 		f.mutex.Lock()
 		recovered = f.recovered
 		f.mutex.Unlock()
-		f.interp.releaseUnreachableChannelSends(f, funcNode)
-		f.interp.releaseInterpretedFuncs(f, funcNode, recovered)
-		f.interp.releaseOwnedObjects(f, funcNode)
+		// Deregister the activation only AFTER the full release sequence and
+		// BEFORE the repanic: while this frame's deferred calls drain —
+		// including a canceled worker's zombie phase, whose interpreted
+		// deferred bodies re-enter runCfg as ordinary activations — the frame
+		// must stay in the incremental sweep's root set, because its cells pin
+		// state the drain can still touch. The defer keeps the registry exact
+		// even if the release sequence itself panics.
+		func() {
+			defer func() {
+				f.interp.funcMu.Lock()
+				if count := f.interp.activeFrames[f]; count <= 1 {
+					delete(f.interp.activeFrames, f)
+				} else {
+					f.interp.activeFrames[f] = count - 1
+				}
+				f.interp.funcMu.Unlock()
+			}()
+			f.interp.releaseUnreachableChannelSends(f, funcNode)
+			f.interp.releaseInterpretedFuncs(f, funcNode, recovered)
+			f.interp.releaseOwnedObjects(f, funcNode)
+		}()
 		if recovered != nil {
 			oNode := originalExecNode(n, exec)
 			if oNode == nil {
@@ -504,6 +546,12 @@ func runCfg(n *node, f *frame, funcNode, callNode *node) {
 }
 
 func execWithFuncSweepFence(exec bltn, f *frame) (next bltn) {
+	// Consume a pending incremental ownership sweep BEFORE any acquisition:
+	// this goroutine holds no locks here, so the sweep can take the fence
+	// exclusively via TryLock and then funcMu — the universal order. A TryLock
+	// loss (a zombie deferred step holds the fence) leaves the request pending
+	// and retries on the next step.
+	f.interp.maybeRunOwnedGCSweep()
 	if f.interp.zombieDefers.Load() > 0 {
 		// A canceled worker's deferred step runs with the fence held
 		// exclusively: its interpreted writes must not overlap another

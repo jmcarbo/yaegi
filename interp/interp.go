@@ -512,26 +512,51 @@ type Interpreter struct {
 	// call never blocks later evaluations.
 	zombieDefers       atomic.Int64
 	funcSweepExclusive atomic.Int64 // depth of exclusive funcSweepMu holders (zombie deferred steps)
-	mutex              sync.RWMutex
-	funcMu             sync.RWMutex
-	funcSweepMu        sync.RWMutex
-	funcMeta           map[reflect.Value]interpretedFuncMeta
-	directFuncs        map[directFuncActivationKey]reflect.Value
-	ownedObjects       map[objectKey]*ownedObject
-	ownedChannels      map[uintptr]*ownedChannel
-	panicTokens        map[*ownedPanicToken]struct{}
+	// ownedGCPending requests one incremental ownership sweep once the
+	// ownership registries cross ownedGCRegistryCap entries; arming happens
+	// under funcMu, consumption under the exclusive funcSweepMu fence.
+	ownedGCPending atomic.Bool
+	// ownedGCInFlight makes sweep consumption one-shot: at most one goroutine
+	// runs the sweep body at a time, and a fence TryLock loss leaves the
+	// request pending for the next execution step.
+	ownedGCInFlight atomic.Bool
+	// frameDrains counts frames currently unwinding deferred calls inside the
+	// runCfg exit path. Incremented under the exclusive funcSweepMu fence so a
+	// sweep holding the fence reads it exactly: a draining frame's remaining
+	// deferred call values are invisible to the sweep's root set, so the
+	// incremental sweep must not run concurrently with any drain.
+	frameDrains   atomic.Int64
+	mutex         sync.RWMutex
+	funcMu        sync.RWMutex
+	funcSweepMu   sync.RWMutex
+	funcMeta      map[reflect.Value]interpretedFuncMeta
+	directFuncs   map[directFuncActivationKey]reflect.Value
+	ownedObjects  map[objectKey]*ownedObject
+	ownedChannels map[uintptr]*ownedChannel
+	panicTokens   map[*ownedPanicToken]struct{}
 	// hostSharedEstimate counts owned objects currently flagged hostShared.
 	// It is maintained exactly under funcMu so the per-write ownership scans
 	// can return in constant time while no object is host-shared.
 	hostSharedEstimate int
-	frame              *frame            // program data storage during execution
-	universe           *scope            // interpreter global level scope
-	scopes             map[string]*scope // package level scopes, indexed by import path
-	srcPkg             imports           // source packages used in interpreter, indexed by path
-	publishedSrcPkg    imports           // immutable symbol snapshots exposed to host readers
-	pkgNames           map[string]string // package names, indexed by import path
-	srcPkgInit         map[string]*sourcePackageInit
-	srcPkgBuild        map[string]*sourcePackageBuild
+	// ownedRegistrations amortizes sweep arming: one request is raised at most
+	// every ownedGCAmortizeRegistrations registry inserts past the cap. Guarded
+	// by funcMu (all arming sites already hold it).
+	ownedRegistrations int
+	// activeFrames refcounts frames with a live runCfg activation, guarded by
+	// funcMu. Refcounted because a root frame can re-enter runCfg through a
+	// reentrant Eval while an outer activation is still on the stack. The
+	// incremental ownership sweep walks every entry's whole ancestor chain as
+	// its root set; frames of forever-blocked goroutines pin one entry each
+	// (Go-like goroutine retention).
+	activeFrames    map[*frame]int
+	frame           *frame            // program data storage during execution
+	universe        *scope            // interpreter global level scope
+	scopes          map[string]*scope // package level scopes, indexed by import path
+	srcPkg          imports           // source packages used in interpreter, indexed by path
+	publishedSrcPkg imports           // immutable symbol snapshots exposed to host readers
+	pkgNames        map[string]string // package names, indexed by import path
+	srcPkgInit      map[string]*sourcePackageInit
+	srcPkgBuild     map[string]*sourcePackageBuild
 	// globalVarIndexes is an immutable-at-runtime snapshot of durable package
 	// variable slots. Compiler passes refresh it before releasing compileMu so
 	// canceled-worker cleanup never walks symbol maps while a later Eval mutates
@@ -555,6 +580,15 @@ const (
 	// source file has not been specified for an Eval.
 	// TODO(mpl): something even more special as a name?
 	DefaultSourceName = "_.go"
+
+	// ownedGCRegistryCap is the ownership registry size (owned objects plus
+	// owned channels) above which incremental sweeps are armed. Bounded
+	// retention per interpreter is the goal; workloads whose live set exceeds
+	// the cap pay one O(live+registry) sweep per amortization window.
+	ownedGCRegistryCap = 1 << 16
+	// ownedGCAmortizeRegistrations is the minimum number of registry inserts
+	// between two armed sweeps, so the O(registry) sweep cost stays amortized.
+	ownedGCAmortizeRegistrations = 1 << 12
 
 	// Test is the value to pass to EvalPath to activate evaluation of test functions.
 	Test = false
@@ -672,6 +706,7 @@ func New(options Options) *Interpreter {
 		ownedObjects:     map[objectKey]*ownedObject{},
 		ownedChannels:    map[uintptr]*ownedChannel{},
 		panicTokens:      map[*ownedPanicToken]struct{}{},
+		activeFrames:     map[*frame]int{},
 	}
 	i.executionGate <- struct{}{}
 	i.frame.interp = &i

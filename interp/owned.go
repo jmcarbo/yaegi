@@ -202,6 +202,7 @@ func (interp *Interpreter) registerOwnedValue(v reflect.Value, owner *frame) {
 		return
 	}
 	interp.ownedObjects[obj.key] = obj
+	interp.armOwnedGCLocked()
 	if owner != nil {
 		if owner.ownedObjects == nil {
 			owner.ownedObjects = map[*ownedObject]struct{}{}
@@ -222,6 +223,7 @@ func (interp *Interpreter) registerOwnedChannel(v reflect.Value, owner *frame) {
 	}
 	channel := &ownedChannel{hold: v, owner: owner}
 	interp.ownedChannels[ptr] = channel
+	interp.armOwnedGCLocked()
 	if owner != nil {
 		if owner.ownedChannels == nil {
 			owner.ownedChannels = map[*ownedChannel]struct{}{}
@@ -438,6 +440,7 @@ func (interp *Interpreter) publishOwnedChannelLocked(v reflect.Value) {
 	if channel == nil {
 		channel = &ownedChannel{hold: v}
 		interp.ownedChannels[ptr] = channel
+		interp.armOwnedGCLocked()
 	}
 	channel.hostVisible = true
 	for _, send := range channel.sends {
@@ -990,6 +993,7 @@ func (interp *Interpreter) registerNativeResultValuesFromExec(owner *frame, valu
 						obj.hostShared = true
 						interp.hostSharedEstimate++
 						interp.ownedObjects[obj.key] = obj
+						interp.armOwnedGCLocked()
 						if owner != nil {
 							if owner.ownedObjects == nil {
 								owner.ownedObjects = map[*ownedObject]struct{}{}
@@ -1856,6 +1860,7 @@ func (interp *Interpreter) adoptOwnedObjectLocked(owner *frame, obj *ownedObject
 				interp.transferOwnedObjectLocked(existing, owner)
 			} else {
 				interp.ownedObjects[pending.key] = pending
+				interp.armOwnedGCLocked()
 				if owner.ownedObjects == nil {
 					owner.ownedObjects = map[*ownedObject]struct{}{}
 				}
@@ -2230,7 +2235,7 @@ func (interp *Interpreter) releaseOwnedObjects(f *frame, funcNode *node) {
 		src := ownershipSource{owner: owner, reachable: map[*ownedObject]struct{}{}, intervals: &visitedIntervalCollector{}}
 		seen := map[*ownedObject]struct{}{}
 		for _, value := range values {
-			interp.collectReachableObjectsLocked(value, src.reachable, seen, src.intervals)
+			interp.collectReachableObjectsLocked(value, src.reachable, seen, src.intervals, nil)
 		}
 		src.intervals.sort()
 		sources = append(sources, src)
@@ -2348,22 +2353,40 @@ func (interp *Interpreter) sweepRootOwnedObjectsLocked(root *frame) {
 	values := interp.snapshotOwnedReachabilityValues(root)
 	interp.funcMu.Lock()
 	defer interp.funcMu.Unlock()
+	interp.sweepOwnedObjectsValuesLocked(root, values, nil)
+}
+
+// sweepOwnedObjectsValuesLocked evicts ownership metadata for objects
+// unreachable from the given root values plus the capture cells of the
+// relevant funcMeta groups. When root is non-nil only objects owned below root
+// are candidates and only root's visible/opaque metadata captures seed the
+// collector (the Eval-end sweep); when root is nil every owned object is a
+// candidate and every group's capture cells seed it (the incremental ownedGC
+// sweep). The eviction predicate itself is identical in both modes:
+// channelRefs == 0, no panic token, not in the reachable set, and interior
+// pointers of visited storage are kept. When channels is non-nil, registered
+// owned channels found in the traversed graph are recorded there, so the
+// incremental sweep reuses this traversal for its channel eviction. The
+// caller holds funcMu; the exclusive funcSweepMu fence must be held so frame
+// cells and registries cannot change concurrently.
+func (interp *Interpreter) sweepOwnedObjectsValuesLocked(root *frame, values []reflect.Value, channels map[uintptr]struct{}) {
 	metas := make([]interpretedFuncMeta, 0, len(interp.funcMeta))
 	for _, meta := range interp.funcMeta {
-		if meta.frame != nil && meta.frame.root == root && (meta.retention == funcMetaVisible || meta.retention == funcMetaOpaque) {
-			metas = append(metas, meta)
+		if root != nil && (meta.frame == nil || meta.frame.root != root || meta.retention != funcMetaVisible && meta.retention != funcMetaOpaque) {
+			continue
 		}
+		metas = append(metas, meta)
 	}
 	// Compute reachability in one traversal instead of one containment walk
-	// per owned object: collect the objects resolvable from the durable root
-	// values, plus the address intervals of every traversed node so Ptr-kind
+	// per owned object: collect the objects resolvable from the root values,
+	// plus the address intervals of every traversed node so Ptr-kind
 	// targets reachable only as interior pointers of raw storage are kept,
 	// matching ownedValueContainsObjectLocked semantics.
 	reachableSet := map[*ownedObject]struct{}{}
 	visited := &visitedIntervalCollector{}
 	seen := map[*ownedObject]struct{}{}
 	for _, value := range values {
-		interp.collectReachableObjectsLocked(value, reachableSet, seen, visited)
+		interp.collectReachableObjectsLocked(value, reachableSet, seen, visited, channels)
 	}
 	for _, meta := range metas {
 		if meta.group == nil {
@@ -2373,12 +2396,15 @@ func (interp *Interpreter) sweepRootOwnedObjectsLocked(root *frame) {
 			if capture.frame == nil || capture.index < 0 || capture.index >= len(capture.frame.data) {
 				continue
 			}
-			interp.collectReachableObjectsLocked(capture.frame.data[capture.index], reachableSet, seen, visited)
+			interp.collectReachableObjectsLocked(capture.frame.data[capture.index], reachableSet, seen, visited, channels)
 		}
 	}
 	visited.sort()
 	for _, target := range interp.ownedObjects {
-		if target.owner == nil || target.owner.root != root || target.channelRefs > 0 || ownedObjectHasPanicToken(target) {
+		if target.owner == nil || target.channelRefs > 0 || ownedObjectHasPanicToken(target) {
+			continue
+		}
+		if root != nil && target.owner.root != root {
 			continue
 		}
 		if _, ok := reachableSet[target]; ok {
@@ -2389,6 +2415,170 @@ func (interp *Interpreter) sweepRootOwnedObjectsLocked(root *frame) {
 		}
 		interp.unregisterOwnedObjectLocked(target)
 		delete(target.owner.ownedObjects, target)
+	}
+}
+
+// armOwnedGCLocked bounds the ownership registries: once their combined size
+// crosses ownedGCRegistryCap, one incremental sweep is requested per
+// ownedGCAmortizeRegistrations inserts. The caller holds funcMu (every
+// registry insert site calls this from its existing critical section).
+// Arming must never take or upgrade the funcSweepMu fence: insert sites run
+// under funcMu inside fence-holding callers (e.g. publishHostValueLocked),
+// the fence is not reentrant, and upgrading while holding funcMu could fatal
+// against write-held sections. The request is consumed later, where the
+// goroutine holds no locks.
+func (interp *Interpreter) armOwnedGCLocked() {
+	interp.ownedRegistrations++
+	if len(interp.ownedObjects)+len(interp.ownedChannels) < ownedGCRegistryCap {
+		return
+	}
+	if interp.ownedRegistrations < ownedGCAmortizeRegistrations {
+		return
+	}
+	interp.ownedRegistrations = 0
+	interp.ownedGCPending.CompareAndSwap(false, true)
+}
+
+// maybeRunOwnedGCSweep consumes a pending incremental sweep request. The
+// caller must hold no locks: the sweep acquires the funcSweepMu fence
+// exclusively via TryLock and then funcMu for the whole body, which is the
+// universal fence-before-funcMu order (the reverse is forbidden: registry
+// insert sites hold funcMu inside fence-holding callers). A TryLock loss
+// leaves the request pending; the next execution step retries. inFlight and
+// the fence are always released, including on panic.
+func (interp *Interpreter) maybeRunOwnedGCSweep() {
+	if !interp.ownedGCPending.Load() {
+		return
+	}
+	if !interp.ownedGCInFlight.CompareAndSwap(false, true) {
+		return
+	}
+	defer interp.ownedGCInFlight.Store(false)
+	if !interp.funcSweepMu.TryLock() {
+		return
+	}
+	func() {
+		defer interp.funcSweepMu.Unlock()
+		// The fence is held exclusively here, so the check is exact: a drain
+		// cannot start underneath the sweep (frameDrains is incremented under
+		// the fence in runCfg). A draining frame's remaining deferred call
+		// values are invisible to the root set, so the sweep must wait; the
+		// request stays pending and a later step consumes it.
+		if interp.frameDrains.Load() != 0 {
+			return
+		}
+		interp.ownedGCPending.Store(false)
+		interp.ownedGCSweepLocked()
+	}()
+}
+
+// ownedGCSweepLocked runs one incremental ownership sweep against the complete
+// active root set. It evicts strictly less than the Eval-end sweep would: the
+// root set below is a superset of snapshotOwnedReachabilityValues(root) plus
+// every capture cell, so cancel/detach isolation is preserved without any
+// relaxation of the eviction predicates. Locking: the caller holds the
+// funcSweepMu fence exclusively (via maybeRunOwnedGCSweep's TryLock, or
+// directly from prepareExecutionFrame) and must not hold funcMu; the body
+// takes funcMu for its whole extent and reads frame cells via
+// snapshotFrameValues under f.mutex.RLock taken after funcMu, matching
+// releaseOwnedObjects' order. The exclusive fence guarantees no interpreted
+// step mutates frame cells or registries concurrently.
+func (interp *Interpreter) ownedGCSweepLocked() {
+	// (1) Durable globals of the current root. Taken before funcMu: the
+	// snapshot acquires interp.mutex and the root's frame mutex only.
+	values := interp.snapshotOwnedReachabilityValues(interp.frame)
+	interp.funcMu.Lock()
+	defer interp.funcMu.Unlock()
+	// (2) Every frame with a live runCfg activation, plus its full ancestor
+	// chain up to and including its root: ALL cells, regardless of funcState.
+	// This covers parked-in-native and zombie-draining frames; the frame
+	// registry itself is maintained by runCfg.
+	seenFrames := map[*frame]struct{}{}
+	for f := range interp.activeFrames {
+		for current := f; current != nil; current = current.anc {
+			if _, seen := seenFrames[current]; seen {
+				break
+			}
+			seenFrames[current] = struct{}{}
+			values = append(values, snapshotFrameValues(current)...)
+		}
+	}
+	// (3) Every funcMeta group's capture cells, read directly under funcMu.
+	// snapshotFuncMetaCapture cannot be used here: it acquires funcMu.RLock
+	// (self-deadlock under funcMu.Lock) and returns a copy, whose fresh
+	// storage would defeat the interior-pointer keep-alive of the interval
+	// collector. The exclusive fence makes the direct reads race-free.
+	for _, meta := range interp.funcMeta {
+		if meta.group == nil {
+			continue
+		}
+		for _, capture := range meta.group.captures {
+			if capture.frame == nil || capture.index < 0 || capture.index >= len(capture.frame.data) {
+				continue
+			}
+			values = append(values, capture.frame.data[capture.index])
+		}
+	}
+	// (4) directFuncs activations.
+	for _, value := range interp.directFuncs {
+		values = append(values, value)
+	}
+	// One collector traversal over the union drives both evictions: object
+	// eviction uses exactly the sweepRootOwnedObjects predicate (see
+	// sweepOwnedObjectsValuesLocked), generalized to candidates across every
+	// root — an object unreachable from the union is dead in the same sense
+	// the Eval-end sweep already treats unreachable current-root objects —
+	// while the channel extension records owned-channel hits for the channel
+	// eviction below.
+	reachableChannels := map[uintptr]struct{}{}
+	interp.sweepOwnedObjectsValuesLocked(nil, values, reachableChannels)
+	// Channel eviction (F1c): mirror sweepRootOwnedChannels semantics against
+	// the larger root set. Candidates must be non-host-visible, carry no
+	// non-terminal sends (terminal ones are already removed from .sends by
+	// retireOwnedChannelSendLocked), and be unreachable from the union. An
+	// owner frame with a live non-root activation is kept: a draining or
+	// mid-flight frame may hold the only reference in its deferred call
+	// values. A channel value buffered inside another channel is not
+	// reflect-traversable, so channels referenced by pending send values are
+	// pinned explicitly.
+	pendingSendValues := []reflect.Value{}
+	for _, channel := range interp.ownedChannels {
+		for _, send := range channel.sends {
+			pendingSendValues = append(pendingSendValues, send.value)
+			if send.pending.IsValid() {
+				pendingSendValues = append(pendingSendValues, send.pending)
+			}
+		}
+	}
+	unreachable := []*ownedChannel{}
+	for ptr, channel := range interp.ownedChannels {
+		if channel.hostVisible || len(channel.sends) != 0 {
+			continue
+		}
+		if _, ok := reachableChannels[ptr]; ok {
+			continue
+		}
+		if owner := channel.owner; owner != nil && owner != owner.root && interp.activeFrames[owner] > 0 {
+			continue
+		}
+		pinned := false
+		for _, value := range pendingSendValues {
+			if interp.ownedValueContainsChannelLocked(value, ptr, map[*ownedObject]struct{}{}) {
+				pinned = true
+				break
+			}
+		}
+		if pinned {
+			continue
+		}
+		unreachable = append(unreachable, channel)
+	}
+	for _, channel := range unreachable {
+		delete(interp.ownedChannels, channel.hold.Pointer())
+		if channel.owner != nil {
+			delete(channel.owner.ownedChannels, channel)
+		}
+		channel.sends = nil
 	}
 }
 
@@ -2452,16 +2642,28 @@ func (v *visitedIntervalCollector) contains(ptr uintptr) bool {
 
 // collectReachableObjectsLocked gathers every owned object resolvable from v
 // into reachable, and records the address interval of every visited node.
-// Traversal pruning mirrors ownedValueContainsObjectLocked: containers that
-// resolve to no owned object are not descended, hostShared objects stop the
-// descent, and already-seen objects prune revisits of identical storage.
-func (interp *Interpreter) collectReachableObjectsLocked(v reflect.Value, reachable map[*ownedObject]struct{}, seen map[*ownedObject]struct{}, visited *visitedIntervalCollector) {
+// When channels is non-nil, every registered owned channel whose value is
+// found in the traversed graph is recorded by pointer, so a channel sweep can
+// reuse the same traversal (existing callers pass nil). Traversal pruning
+// mirrors ownedValueContainsObjectLocked: containers that resolve to no owned
+// object are not descended, hostShared objects stop the descent, and
+// already-seen objects prune revisits of identical storage.
+func (interp *Interpreter) collectReachableObjectsLocked(v reflect.Value, reachable map[*ownedObject]struct{}, seen map[*ownedObject]struct{}, visited *visitedIntervalCollector, channels map[uintptr]struct{}) {
 	v = unwrapOwnedValue(v)
 	if !v.IsValid() {
 		return
 	}
 	visited.record(v)
 	switch v.Kind() {
+	case reflect.Chan:
+		if channels == nil || v.IsNil() {
+			return
+		}
+		if ptr := v.Pointer(); ptr != 0 {
+			if _, owned := interp.ownedChannels[ptr]; owned {
+				channels[ptr] = struct{}{}
+			}
+		}
 	case reflect.Map, reflect.Ptr, reflect.Slice:
 		objects := interp.ownedObjectsForValueLocked(v)
 		if len(objects) == 0 {
@@ -2481,15 +2683,15 @@ func (interp *Interpreter) collectReachableObjectsLocked(v reflect.Value, reacha
 		case reflect.Map:
 			iter := v.MapRange()
 			for iter.Next() {
-				interp.collectReachableObjectsLocked(iter.Key(), reachable, seen, visited)
-				interp.collectReachableObjectsLocked(iter.Value(), reachable, seen, visited)
+				interp.collectReachableObjectsLocked(iter.Key(), reachable, seen, visited, channels)
+				interp.collectReachableObjectsLocked(iter.Value(), reachable, seen, visited, channels)
 			}
 		case reflect.Ptr:
-			interp.collectReachableObjectsLocked(v.Elem(), reachable, seen, visited)
+			interp.collectReachableObjectsLocked(v.Elem(), reachable, seen, visited, channels)
 		case reflect.Slice:
 			full := v.Slice(0, v.Cap())
 			for index := 0; index < full.Len(); index++ {
-				interp.collectReachableObjectsLocked(full.Index(index), reachable, seen, visited)
+				interp.collectReachableObjectsLocked(full.Index(index), reachable, seen, visited, channels)
 			}
 		}
 	case reflect.UnsafePointer:
@@ -2502,7 +2704,7 @@ func (interp *Interpreter) collectReachableObjectsLocked(v reflect.Value, reacha
 		}
 		for index := 0; index < v.NumField(); index++ {
 			if v.Field(index).CanInterface() {
-				interp.collectReachableObjectsLocked(v.Field(index), reachable, seen, visited)
+				interp.collectReachableObjectsLocked(v.Field(index), reachable, seen, visited, channels)
 			}
 		}
 	case reflect.Array:
@@ -2510,7 +2712,7 @@ func (interp *Interpreter) collectReachableObjectsLocked(v reflect.Value, reacha
 			return
 		}
 		for index := 0; index < v.Len(); index++ {
-			interp.collectReachableObjectsLocked(v.Index(index), reachable, seen, visited)
+			interp.collectReachableObjectsLocked(v.Index(index), reachable, seen, visited, channels)
 		}
 	}
 }
@@ -3317,6 +3519,7 @@ func (c *detachedRootCloner) commit() {
 			c.interp.hostSharedEstimate++
 		}
 		c.interp.ownedObjects[key] = obj
+		c.interp.armOwnedGCLocked()
 		if c.newRoot.ownedObjects == nil {
 			c.newRoot.ownedObjects = map[*ownedObject]struct{}{}
 		}
@@ -3456,6 +3659,7 @@ func (c *detachedRootCloner) commitTargeted(owner *frame) {
 		}
 		obj.owner = owner
 		c.interp.ownedObjects[key] = obj
+		c.interp.armOwnedGCLocked()
 		if owner.ownedObjects == nil {
 			owner.ownedObjects = map[*ownedObject]struct{}{}
 		}

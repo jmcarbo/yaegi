@@ -389,6 +389,25 @@ func (interp *Interpreter) prepareExecutionFrame(cancel <-chan struct{}) (*frame
 	f.done = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(cancel)}
 	f.cancel = cancel
 	f.mutex.Unlock()
+
+	// Secondary ownedGC trigger: the fence is already held exclusively here,
+	// so a pending sweep runs inline against the Locked body instead of
+	// upgrading later — the fence must never be (re)acquired while funcMu is
+	// held, and the registry insert sites only arm under funcMu. The same
+	// inFlight CAS guards against the exec-step trigger; a panic still clears
+	// inFlight and the enclosing defer releases the fence. The frameDrains
+	// check is exact under the held fence: a drain starting underneath would
+	// have to take the fence first.
+	if interp.ownedGCPending.Load() && interp.ownedGCInFlight.CompareAndSwap(false, true) {
+		func() {
+			defer interp.ownedGCInFlight.Store(false)
+			if interp.frameDrains.Load() != 0 {
+				return
+			}
+			interp.ownedGCPending.Store(false)
+			interp.ownedGCSweepLocked()
+		}()
+	}
 	return f, nil
 }
 
