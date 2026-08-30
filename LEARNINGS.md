@@ -61,9 +61,26 @@
 - Known growth boundary: interpreted function values that cross the Eval API
   keep their metadata marked opaque, which is never deleted, so every returned
   or host-retained closure pins its captures and compiled graph permanently
-  (measured: ~255 KB per Eval across 20k sequential Evals). A host-facing
-  purge API or self-describing wrapper metadata is needed before long-lived
-  REPL-style interpreters are safe.
+  (measured: ~255 KB per Eval across 20k sequential Evals). PurgeRetainedFuncs
+  is the manual reclamation path. The long-term fix — a weak funcval-keyed
+  registry that reclaims metadata when the host drops the wrapper — was
+  probed and is mechanically feasible but is a full keying rework, not an
+  additive layer: as long as funcMeta holds the reflect.Value key, the map
+  itself retains the wrapper and no weak mechanism can observe the drop.
+  Verified probe results for the future rework: (1) a func value's identity
+  is its funcval address, readable as the single word of a func variable and
+  identical to reflect.Value's internal comparison identity, so map[uintptr]
+  keying preserves today's key semantics; (2) runtime.SetFinalizer accepts
+  the funcval address behind a typed pointer and fires exactly when the
+  wrapper becomes unreachable — reflect.Value.Pointer() (a code pointer) and
+  raw unsafe.Pointer are rejected; (3) address reuse after a drop needs a
+  generation guard (finalizer deletes only if the entry's generation still
+  matches); (4) every consumer that uses a map key as a reflect.Value
+  (types, invocation, endpoint matching in the purge, frame funcMeta
+  slices) must switch to the pointer domain, storing reflect.Type in the
+  entry for the convertible-type fallback. None of this is additive on top
+  of the existing value-keyed map, so it lands only as a dedicated change
+  with the isolation and retention suites re-derived.
 - Reentrancy for the execution gate is an explicit token scoped to the
   goroutine running the execution, not a native stack probe: any goroutine
   running interpreted code has runCfg on its stack, including goroutines
@@ -122,11 +139,18 @@
   purge's endpoint rule. Eviction is transparent: the cache is consulted
   only after a successful metadata lookup keyed by the live activation
   root, so a dropped line costs at most one extra clone.
-- Known open item: an incremental Eval beginning with `func` permanently adds
-  1-3 global-frame slots on this branch (master adds none) because the
-  anti-replay fix returns the wrapper body, which compiles in global scope
-  where each func literal allocates a persistent slot. Wrapping the body in a
-  one-shot function literal does not help: the literal's own value slot is
-  allocated in the enclosing scope before its function scope is pushed. Sound
-  fixes need codegen for immediately-called literals or a scheduler-level
-  one-shot declaration; both are larger redesigns.
+- Known open item (decision recorded 2026-08-30): an incremental Eval
+  beginning with `func` permanently adds 1-3 global-frame slots on this
+  branch (master adds none) because the anti-replay fix returns the wrapper
+  body, which compiles in global scope where each func literal allocates a
+  persistent slot (cfg.go funcLit pushes n.findex = sc.add(n.typ) in the
+  enclosing scope). Wrapping the body in a one-shot function literal does
+  not help: the literal's own value slot is allocated in the enclosing
+  scope before its function scope is pushed. The chosen future direction is
+  codegen for immediately-called function literals at root level (a
+  callExpr whose fun is a funcLit compiles to a direct activation without a
+  registry slot); transient slot recycling was rejected because root-frame
+  slots are reachable by goroutine-safe code paths (a `go` statement can
+  capture any slot), and the scheduler-level one-shot declaration remains
+  rejected. Severity is REPL-shaped (thousands of func-Evals on one
+  interpreter); behavior is otherwise master-compatible.
