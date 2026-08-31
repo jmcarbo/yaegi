@@ -319,7 +319,10 @@ func (interp *Interpreter) interpretedFunc(v reflect.Value) (interpretedFuncInvo
 // The registry is keyed by v's funcval address, so a direct hit covers both
 // the exact registered type and any convertible named type over the same
 // funcval: a funcval is always created under one concrete signature, and func
-// conversions between identical underlying types preserve the funcval.
+// conversions between identical underlying types preserve the funcval. The
+// registered type is still checked (equal or convertible) as a safety net,
+// mirroring the value-keyed registry's canonical-equality plus
+// convertible-fallback semantics at the cost of one type comparison.
 func (interp *Interpreter) lookupInterpretedFunc(v reflect.Value) (uintptr, interpretedFuncMeta, bool) {
 	key, ok := funcvalKeyOf(v)
 	if !ok {
@@ -327,6 +330,9 @@ func (interp *Interpreter) lookupInterpretedFunc(v reflect.Value) (uintptr, inte
 	}
 	interp.funcMu.RLock()
 	meta, ok := interp.funcMeta[key]
+	if ok && meta.typ != nil && v.Type() != meta.typ && !v.Type().ConvertibleTo(meta.typ) {
+		ok = false
+	}
 	interp.funcMu.RUnlock()
 	return key, meta, ok
 }

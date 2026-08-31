@@ -84,8 +84,9 @@
   the pointer domain — lookup, func-value walks and collectors, the purge,
   the root sweeps, frame key lists, directFuncs source keys, the cloner's
   snapshot maps, and the bound-wrapper cache keys. One entry exists per
-  funcval, storing its registered reflect.Type for convertible lookups,
-  which collapsed the convertible-type fallback scans into direct hits.
+  funcval, storing its registered reflect.Type, which collapsed the
+  fallback scans into a direct hit plus a single type gate (equal or
+  convertible), preserving the value-keyed semantics as a safety net.
   Each insertion arms a runtime.SetFinalizer that deletes the entry when
   the wrapper becomes unreachable; a per-entry generation counter makes a
   stale finalizer harmless when an address is reused, and arming clears any
