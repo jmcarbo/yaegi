@@ -39,6 +39,10 @@ func (check typecheck) assignment(n *node, typ *itype, context string) error {
 	if n.typ == nil {
 		return n.cfgErrorf("invalid type in %s", context)
 	}
+	if n.isType(check.scope) {
+		// A type name used where a value is required (e.g. u := url.URL).
+		return n.cfgErrorf("type %s is not an expression", n.typ.id())
+	}
 	if n.typ.untyped {
 		if typ == nil || isInterface(typ) {
 			if typ == nil && n.typ.cat == nilT {

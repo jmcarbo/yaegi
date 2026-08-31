@@ -407,7 +407,7 @@ func (interp *Interpreter) pkgDir(goPath string, root, importPath string) (strin
 
 	if root == "" {
 		if interp.context.GOPATH == "" {
-			return "", "", fmt.Errorf("unable to find source related to: %q. Either the GOPATH environment variable, or the Interpreter.Options.GoPath needs to be set", importPath)
+			return "", "", fmt.Errorf("unable to find source related to: %q. The Interpreter.Options.GoPath needs to be set (the interpreter library does not read the GOPATH environment variable, but the yaegi command does and passes it as GoPath)", importPath)
 		}
 		return "", "", fmt.Errorf("unable to find source related to: %q", importPath)
 	}
