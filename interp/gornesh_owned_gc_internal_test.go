@@ -513,9 +513,9 @@ var keptCounterDirectGornesh = makeCounterDirectGornesh()
 	deadRootEntry := directFuncActivationKey{source: keptKey, root: deadRoot}
 
 	i.funcMu.Lock()
-	i.directFuncs[liveEntry] = value
-	i.directFuncs[deadEndpointsEntry] = deadFunc
-	i.directFuncs[deadRootEntry] = value
+	i.directFuncs[liveEntry] = newDirectFuncActivation(value)
+	i.directFuncs[deadEndpointsEntry] = newDirectFuncActivation(deadFunc)
+	i.directFuncs[deadRootEntry] = newDirectFuncActivation(value)
 	i.funcMu.Unlock()
 
 	i.ownedGCPending.Store(true)

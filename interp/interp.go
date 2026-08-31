@@ -206,6 +206,14 @@ type directFuncActivationKey struct {
 	root   *frame
 }
 
+// directFuncActivation is a cached direct activation: the cloned wrapper plus
+// its funcval key, stored so eviction paths can match the value endpoint
+// without deriving the key (an allocation) under funcMu.
+type directFuncActivation struct {
+	value reflect.Value
+	key   uintptr
+}
+
 func (f *frame) setCallArg(n *node, value reflect.Value) {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
@@ -566,7 +574,7 @@ type Interpreter struct {
 	// finalizer armed at insertion deletes the entry (guarded by the entry's
 	// generation against funcval address reuse).
 	funcMeta      map[uintptr]interpretedFuncMeta
-	directFuncs   map[directFuncActivationKey]reflect.Value
+	directFuncs   map[directFuncActivationKey]directFuncActivation
 	ownedObjects  map[objectKey]*ownedObject
 	ownedChannels map[uintptr]*ownedChannel
 	panicTokens   map[*ownedPanicToken]struct{}
@@ -738,7 +746,7 @@ func New(options Options) *Interpreter {
 		hooks:            &hooks{},
 		generic:          map[string]*node{},
 		funcMeta:         map[uintptr]interpretedFuncMeta{},
-		directFuncs:      map[directFuncActivationKey]reflect.Value{},
+		directFuncs:      map[directFuncActivationKey]directFuncActivation{},
 		ownedObjects:     map[objectKey]*ownedObject{},
 		ownedChannels:    map[uintptr]*ownedChannel{},
 		panicTokens:      map[*ownedPanicToken]struct{}{},

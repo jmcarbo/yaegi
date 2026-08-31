@@ -74,9 +74,12 @@ func (interp *Interpreter) insertFuncMetaEntryLocked(ref funcvalRef, meta interp
 	}
 	// Sweeps and purges may have deleted the previous entry while its wrapper
 	// is still alive (e.g. a bound alias restored after a sweep); clearing the
-	// leftover finalizer is required before arming a new one. If an old
-	// finalizer was already dequeued for execution, the clear is a no-op and
-	// the stale run is harmless: its generation no longer matches.
+	// leftover finalizer is required before arming a new one. A stale queued
+	// finalizer that the clear could not cancel is harmless for a narrower
+	// reason than the generation counter: the runtime never reuses a funcval
+	// address until its finalizer has executed, so a stale run and a fresh
+	// registration at the same key cannot coexist. The counter remains as
+	// belt-and-braces against future lifetime changes.
 	runtime.SetFinalizer(ref.ptr, nil)
 	key := ref.key
 	runtime.SetFinalizer(ref.ptr, func(fv *funcval) {
@@ -114,12 +117,8 @@ func (interp *Interpreter) evictFuncMetaKeyLocked(key uintptr, generation uint64
 	if meta.frame != nil {
 		removeFrameFuncMetaKeyLocked(meta.frame, key)
 	}
-	for activationKey, value := range interp.directFuncs {
-		if activationKey.source == key {
-			delete(interp.directFuncs, activationKey)
-			continue
-		}
-		if valueKey, ok := funcvalKeyOf(value); ok && valueKey == key {
+	for activationKey, activation := range interp.directFuncs {
+		if activationKey.source == key || activation.key == key {
 			delete(interp.directFuncs, activationKey)
 		}
 	}
@@ -1025,13 +1024,12 @@ func (interp *Interpreter) PurgeRetainedFuncs() int {
 	// Drop directFuncs activations whose source or cloned value lost its
 	// metadata: such an entry can never again resolve to discoverable
 	// metadata, and keeping either endpoint would anchor the other forever.
-	for key, value := range interp.directFuncs {
-		valueKey, ok := funcvalKeyOf(value)
-		if !ok {
+	for key, activation := range interp.directFuncs {
+		if activation.key == 0 {
 			continue
 		}
 		if _, deleted := deletedKeys[key.source]; !deleted {
-			if _, deleted := deletedKeys[valueKey]; !deleted {
+			if _, deleted := deletedKeys[activation.key]; !deleted {
 				continue
 			}
 		}
@@ -1111,9 +1109,9 @@ func (interp *Interpreter) sweepRootInterpretedFuncs(root *frame, result reflect
 			}
 		}
 	}
-	for key, value := range interp.directFuncs {
+	for key, activation := range interp.directFuncs {
 		if key.root == root {
-			directValues = append(directValues, value)
+			directValues = append(directValues, activation.value)
 		}
 	}
 	interp.funcMu.RUnlock()

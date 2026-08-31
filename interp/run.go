@@ -484,14 +484,29 @@ func runCfg(n *node, f *frame, funcNode, callNode *node) {
 		f.mutex.Lock()
 		recovered = f.recovered
 		f.mutex.Unlock()
-		// Revert the function literal slots only when the last activation on
-		// this frame exits: a reentrant activation nested on the same frame
-		// must not clobber slots the outer execution still reads.
+		// Revert the function literal slots when this frame exits. The restore
+		// is the only frame-cell writer outside an exec step, so it must hold
+		// the funcSweep fence (read mode) like every step: the incremental
+		// sweep reads capture cells unfenced, trusting the fence for
+		// exclusivity. The fence cannot be held here (the last step released
+		// it and the drain counters are closed), so the read lock is safe.
+		// Skipped when another activation shares this frame's cells through a
+		// lexical clone (a goroutine or closure activation whose cloneOf chain
+		// points at this frame): the shared cell may still be read through the
+		// clone, and such an entry simply stays sweep/purge reclaimable.
 		f.interp.funcMu.Lock()
 		lastActivation := f.interp.activeFrames[f] <= 1
+		for active := range f.interp.activeFrames {
+			if active != f && frameSharesSlotsWith(active, f) {
+				lastActivation = false
+				break
+			}
+		}
 		f.interp.funcMu.Unlock()
 		if lastActivation {
+			f.interp.funcSweepMu.RLock()
 			applyFuncSlotRestores(f)
+			f.interp.funcSweepMu.RUnlock()
 		}
 		// Deregister the activation only AFTER the full release sequence and
 		// BEFORE the repanic: while this frame's deferred calls drain —
@@ -2729,9 +2744,27 @@ func getFunc(n *node) {
 	}
 }
 
+// frameSharesSlotsWith reports whether the active activation a can reach
+// frames whose cells are shared with f: f itself (through ancestry), or a
+// lexical clone whose header copies f's cells (cloneOf == f). False
+// positives are safe: they only skip a slot restore, leaving the entry to
+// the sweep and purge reclamation paths.
+func frameSharesSlotsWith(a, f *frame) bool {
+	for current := a; current != nil; current = current.anc {
+		if current == f || current.cloneOf == f {
+			return true
+		}
+	}
+	return false
+}
+
 // recordFuncSlotRestoreLocked remembers the restore for a literal slot, once
 // per (slot, frame): later executions of the same literal overwrite the slot
-// but must not displace the original restore value. The caller holds f.mutex.
+// but must not displace the original restore value. First-wins is sound
+// because nothing reads a literal slot between a second getFunc execution and
+// frame exit — every later read of the wrapper goes through the value
+// captured at its creation, and the exit restore only serves the registry's
+// weak eviction. The caller holds f.mutex.
 func recordFuncSlotRestoreLocked(f, slotOwner *frame, index int, value reflect.Value) {
 	for _, existing := range f.funcSlots {
 		if existing.owner == slotOwner && existing.index == index {

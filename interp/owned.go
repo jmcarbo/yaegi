@@ -2525,8 +2525,8 @@ func (interp *Interpreter) ownedGCSweepLocked() {
 		}
 	}
 	// (4) directFuncs activations.
-	for _, value := range interp.directFuncs {
-		values = append(values, value)
+	for _, activation := range interp.directFuncs {
+		values = append(values, activation.value)
 	}
 	// One collector traversal over the union drives both evictions: object
 	// eviction uses exactly the sweepRootOwnedObjects predicate (see
@@ -2616,7 +2616,7 @@ func (interp *Interpreter) ownedGCSweepLocked() {
 		for key := range interp.funcMeta {
 			exactKeys[key] = struct{}{}
 		}
-		for key, value := range interp.directFuncs {
+		for key, activation := range interp.directFuncs {
 			if _, live := liveRoots[key.root]; !live {
 				delete(interp.directFuncs, key)
 				continue
@@ -2624,12 +2624,7 @@ func (interp *Interpreter) ownedGCSweepLocked() {
 			if _, live := exactKeys[key.source]; live {
 				continue
 			}
-			valueKey, ok := funcvalKeyOf(value)
-			if !ok {
-				delete(interp.directFuncs, key)
-				continue
-			}
-			if _, live := exactKeys[valueKey]; !live {
+			if _, live := exactKeys[activation.key]; !live {
 				delete(interp.directFuncs, key)
 			}
 		}
@@ -2802,8 +2797,8 @@ type detachedRootCloner struct {
 	newObjects       map[objectKey]*ownedObject
 	pending          map[*ownedObject]reflect.Value
 	rehomeAllFuncs   bool
-	directLineage    map[directFuncActivationKey]reflect.Value
-	directPromotions map[directFuncActivationKey]reflect.Value
+	directLineage    map[directFuncActivationKey]directFuncActivation
+	directPromotions map[directFuncActivationKey]directFuncActivation
 }
 
 func newDetachedRootCloner(interp *Interpreter, oldRoot, newRoot *frame, cancel <-chan struct{}) *detachedRootCloner {
@@ -2817,8 +2812,8 @@ func newDetachedRootCloner(interp *Interpreter, oldRoot, newRoot *frame, cancel 
 		funcRepairs:      map[uintptr][]reflect.Value{},
 		newObjects:       map[objectKey]*ownedObject{},
 		pending:          map[*ownedObject]reflect.Value{},
-		directLineage:    map[directFuncActivationKey]reflect.Value{},
-		directPromotions: map[directFuncActivationKey]reflect.Value{},
+		directLineage:    map[directFuncActivationKey]directFuncActivation{},
+		directPromotions: map[directFuncActivationKey]directFuncActivation{},
 	}
 	interp.funcMu.RLock()
 	for key, obj := range interp.ownedObjects {
@@ -2828,9 +2823,9 @@ func newDetachedRootCloner(interp *Interpreter, oldRoot, newRoot *frame, cancel 
 	for key, meta := range interp.funcMeta {
 		c.funcMeta[key] = meta
 	}
-	for key, value := range interp.directFuncs {
+	for key, activation := range interp.directFuncs {
 		if key.root == oldRoot {
-			c.directLineage[key] = value
+			c.directLineage[key] = activation
 		}
 	}
 	interp.funcMu.RUnlock()
@@ -2839,14 +2834,14 @@ func newDetachedRootCloner(interp *Interpreter, oldRoot, newRoot *frame, cancel 
 
 func (c *detachedRootCloner) cloneDirectFuncLineage() {
 	for key, active := range c.directLineage {
-		clone := c.cloneFunc(active)
-		if clone.IsValid() && !sameFuncvalKey(clone, active) {
-			c.directPromotions[directFuncActivationKey{source: key.source, root: c.newRoot}] = clone
-			if activeKey, ok := funcvalKeyOf(active); ok {
-				c.directPromotions[directFuncActivationKey{source: activeKey, root: c.newRoot}] = clone
+		clone := c.cloneFunc(active.value)
+		if clone.IsValid() && !sameFuncvalKey(clone, active.value) {
+			c.directPromotions[directFuncActivationKey{source: key.source, root: c.newRoot}] = newDirectFuncActivation(clone)
+			if active.key != 0 {
+				c.directPromotions[directFuncActivationKey{source: active.key, root: c.newRoot}] = newDirectFuncActivation(clone)
 			}
 			if cloneKey, ok := funcvalKeyOf(clone); ok {
-				c.directPromotions[directFuncActivationKey{source: cloneKey, root: c.newRoot}] = clone
+				c.directPromotions[directFuncActivationKey{source: cloneKey, root: c.newRoot}] = newDirectFuncActivation(clone)
 			}
 		}
 	}
@@ -3371,6 +3366,17 @@ func (c *detachedRootCloner) cloneFunc(v reflect.Value) reflect.Value {
 	return cloned
 }
 
+// newDirectFuncActivation records a cloned wrapper and its funcval key. The
+// key is derived eagerly (the wrapper is alive at every call site) so eviction
+// paths never allocate under funcMu.
+func newDirectFuncActivation(value reflect.Value) directFuncActivation {
+	activation := directFuncActivation{value: value}
+	if key, ok := funcvalKeyOf(value); ok {
+		activation.key = key
+	}
+	return activation
+}
+
 func directFuncKey(v reflect.Value) (uintptr, bool) {
 	for v.IsValid() {
 		if v.Type() == valueInterfaceType && v.CanInterface() {
@@ -3596,8 +3602,8 @@ func (c *detachedRootCloner) commit() {
 			delete(c.interp.funcMeta, clone.oldKey)
 		}
 	}
-	for key, value := range c.directPromotions {
-		c.interp.directFuncs[key] = value
+	for key, activation := range c.directPromotions {
+		c.interp.directFuncs[key] = activation
 	}
 	c.interp.armOwnedGCLocked()
 	for token := range c.interp.panicTokens {
@@ -3745,11 +3751,12 @@ func (c *detachedRootCloner) commitTargeted(owner *frame) {
 			meta.group.root = owner.root
 		}
 		c.interp.insertFuncMetaEntryLocked(newRef, meta, owner)
-		c.interp.directFuncs[directFuncActivationKey{source: clone.oldKey, root: owner.root}] = clone.value
-		c.interp.directFuncs[directFuncActivationKey{source: newRef.key, root: owner.root}] = clone.value
+		cloneActivation := newDirectFuncActivation(clone.value)
+		c.interp.directFuncs[directFuncActivationKey{source: clone.oldKey, root: owner.root}] = cloneActivation
+		c.interp.directFuncs[directFuncActivationKey{source: newRef.key, root: owner.root}] = cloneActivation
 		for lineageKey, active := range c.directLineage {
-			if activeKey, ok := funcvalKeyOf(active); ok && activeKey == clone.oldKey {
-				c.interp.directFuncs[directFuncActivationKey{source: lineageKey.source, root: owner.root}] = clone.value
+			if active.key == clone.oldKey {
+				c.interp.directFuncs[directFuncActivationKey{source: lineageKey.source, root: owner.root}] = cloneActivation
 			}
 		}
 		c.interp.armOwnedGCLocked()
@@ -3784,7 +3791,7 @@ func (interp *Interpreter) activateDirectFuncFromExec(owner *frame, value reflec
 		cached, cachedOK := interp.directFuncs[cacheKey]
 		interp.funcMu.RUnlock()
 		if cachedOK {
-			activated = cached
+			activated = cached.value
 			return
 		}
 		cloner := newDetachedRootCloner(interp, oldRoot, owner.root, cancel)
@@ -3797,7 +3804,7 @@ func (interp *Interpreter) activateDirectFuncFromExec(owner *frame, value reflec
 		}
 		cloner.commitTargeted(owner.root)
 		interp.funcMu.Lock()
-		interp.directFuncs[cacheKey] = clone
+		interp.directFuncs[cacheKey] = newDirectFuncActivation(clone)
 		interp.armOwnedGCLocked()
 		interp.funcMu.Unlock()
 		activated = clone
