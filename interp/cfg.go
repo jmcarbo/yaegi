@@ -371,17 +371,26 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 			}
 
 			// Pre-define symbols for labels defined in this block, so we are sure that
-			// they are already defined when met.
+			// they are already defined when met. Labels nested in switch case
+			// bodies are function-scoped in Go, so they must be pre-defined
+			// here as well: case bodies do not bound label visibility.
 			// TODO(marc): labels must be stored outside of symbols to avoid collisions.
-			for _, c := range n.child {
-				if c.kind != labeledStmt {
-					continue
+			var predefineLabels func(sn *node)
+			predefineLabels = func(sn *node) {
+				for _, c := range sn.child {
+					switch c.kind {
+					case labeledStmt:
+						label := c.child[0].ident
+						sym := &symbol{kind: labelSym, node: c, index: -1}
+						sc.sym[label] = sym
+						c.sym = sym
+						predefineLabels(c)
+					case caseBody, caseClause, commClause:
+						predefineLabels(c)
+					}
 				}
-				label := c.child[0].ident
-				sym := &symbol{kind: labelSym, node: c, index: -1}
-				sc.sym[label] = sym
-				c.sym = sym
 			}
+			predefineLabels(n)
 			// If block is the body of a function, get declared variables in current scope.
 			// This is done in order to add the func signature symbols into sc.sym,
 			// as we will need them in post-processing.
