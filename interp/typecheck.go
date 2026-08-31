@@ -748,6 +748,8 @@ var builtinFuncs = map[string]struct {
 	bltnReal:     {args: 1, variadic: false},
 	bltnRecover:  {args: 0, variadic: false},
 	bltnSizeof:   {args: 1, variadic: false},
+	"unsafe.Slice":  {args: 2, variadic: false},
+	"unsafe.String": {args: 2, variadic: false},
 }
 
 func (check typecheck) builtin(name string, n *node, child []*node, ellipsis bool) error {
@@ -982,6 +984,24 @@ func (check typecheck) builtin(name string, n *node, child []*node, ellipsis boo
 		}
 	case bltnRecover, bltnNew, bltnAlignof, bltnOffsetof, bltnSizeof:
 		// Nothing to do.
+	case "unsafe.Slice":
+		t0 := params[0].Type().TypeOf()
+		if t0 == nil || t0.Kind() != reflect.Ptr {
+			return params[0].nod.cfgErrorf("invalid argument: unsafe.Slice requires a pointer, have %s", params[0].Type().id())
+		}
+		if t1 := params[1].Type().TypeOf(); !isInt(t1) {
+			return params[1].nod.cfgErrorf("invalid argument: unsafe.Slice length must be an integer, have %s", params[1].Type().id())
+		}
+	case "unsafe.String":
+		t0 := params[0].Type().TypeOf()
+		ok := t0 != nil && ((t0.Kind() == reflect.Ptr && t0.Elem().Kind() == reflect.Uint8) ||
+			(t0.Kind() == reflect.Slice && t0.Elem().Kind() == reflect.Uint8))
+		if !ok {
+			return params[0].nod.cfgErrorf("invalid argument: unsafe.String requires a *byte or []byte, have %s", params[0].Type().id())
+		}
+		if t1 := params[1].Type().TypeOf(); !isInt(t1) {
+			return params[1].nod.cfgErrorf("invalid argument: unsafe.String length must be an integer, have %s", params[1].Type().id())
+		}
 	default:
 		return n.cfgErrorf("unsupported builtin %s", name)
 	}

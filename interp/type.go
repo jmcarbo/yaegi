@@ -676,6 +676,16 @@ func nodeType2(interp *Interpreter, sc *scope, n *node, seen []*node) (t *itype,
 				t.incomplete = incomplete
 			case bltnRecover:
 				t = sc.getType("interface{}")
+			case "unsafe.Slice":
+				t, err = nodeType2(interp, sc, n.child[1], seen)
+				if err != nil {
+					return nil, err
+				}
+				if pt := t.TypeOf(); pt != nil && pt.Kind() == reflect.Ptr {
+					t = sliceOf(valueTOf(pt.Elem(), withScope(sc)), withScope(sc))
+				}
+			case "unsafe.String":
+				t = sc.getType("string")
 			default:
 				t = &itype{cat: builtinT}
 			}
@@ -1369,7 +1379,7 @@ func (t *itype) numOut() int {
 		}
 	case builtinT:
 		switch t.name {
-		case "append", "cap", "complex", "copy", "imag", "len", "make", "max", "min", "new", "real", "recover", "unsafe.Alignof", "unsafe.Offsetof", "unsafe.Sizeof":
+		case "append", "cap", "complex", "copy", "imag", "len", "make", "max", "min", "new", "real", "recover", "unsafe.Alignof", "unsafe.Offsetof", "unsafe.Sizeof", "unsafe.Slice", "unsafe.String":
 			return 1
 		}
 	}

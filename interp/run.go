@@ -4578,6 +4578,57 @@ func valueLess(a, b reflect.Value) bool {
 	return false
 }
 
+// unsafeBuiltin compiles the unsafe.Slice and unsafe.String builtins. The
+// destination type is computed at compile time from the pointer argument
+// type; the runtime slices the memory range without copying it.
+func unsafeBuiltin(n *node) {
+	next := getExec(n.tnext)
+	dest := genValueOutput(n, n.typ.TypeOf())
+	value0 := genValue(n.child[1])
+	value1 := genValue(n.child[2])
+	isStringB := n.child[0].ident == "unsafe.String"
+	destType := n.typ.TypeOf()
+
+	n.exec = func(f *frame) bltn {
+		p := value0(f)
+		l := int(value1(f).Int())
+		if isStringB {
+			if l < 0 {
+				panic("unsafe.String: length out of range")
+			}
+			var s string
+			if p.Kind() == reflect.Slice {
+				if l > p.Len() {
+					panic("unsafe.String: length out of range")
+				}
+				data := (*reflect.SliceHeader)(unsafe.Pointer(p.UnsafeAddr())) //nolint:gosec
+				s = unsafe.String((*byte)(unsafe.Pointer(data.Data)), l)
+			} else {
+				s = unsafe.String((*byte)(unsafe.Pointer(p.Pointer())), l)
+			}
+			dest(f).Set(reflect.ValueOf(s).Convert(destType))
+			return next
+		}
+		if p.IsNil() {
+			if l != 0 {
+				panic("unsafe.Slice: ptr is nil and len is not zero")
+			}
+			dest(f).Set(reflect.Zero(destType))
+			return next
+		}
+		if l < 0 {
+			panic("unsafe.Slice: len out of range")
+		}
+		s := reflect.New(destType).Elem()
+		h := (*reflect.SliceHeader)(unsafe.Pointer(s.UnsafeAddr())) //nolint:gosec
+		h.Data = p.Pointer()
+		h.Len = l
+		h.Cap = l
+		dest(f).Set(s)
+		return next
+	}
+}
+
 func _new(n *node) {
 	next := getExec(n.tnext)
 	t1 := n.child[1].typ

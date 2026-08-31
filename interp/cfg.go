@@ -1370,6 +1370,12 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				}
 
 				n.gen = c0.sym.builtin
+				if bname == "unsafe.Slice" || bname == "unsafe.String" {
+					// The result type is a slice or string, not builtinT:
+					// set the generator here, the builtinT switch below is
+					// not reached.
+					n.gen = unsafeBuiltin
+				}
 				c0.typ = &itype{cat: builtinT, name: bname}
 				if n.typ, err = nodeType(interp, sc, n); err != nil {
 					return
@@ -2045,7 +2051,7 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 					} else {
 						n.typ = valueTOf(fixPossibleConstType(s.Type()), withUntyped(isValueUntyped(s)))
 						n.rval = s
-						if pkg == "unsafe" && (name == "AlignOf" || name == "Offsetof" || name == "Sizeof") {
+						if pkg == "unsafe" && (name == "Alignof" || name == "Offsetof" || name == "Sizeof" || name == "Slice" || name == "String") {
 							n.sym = &symbol{kind: bltnSym, node: n, rval: s}
 							n.ident = pkg + "." + name
 						}
