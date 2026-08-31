@@ -72,6 +72,13 @@ func (interp *Interpreter) importSrcLocked(rPath, importPath string, skipTest bo
 	var dir string
 	var err error
 
+	switch importPath {
+	case "C":
+		return "", fmt.Errorf("cgo is not supported: %q cannot be imported from interpreted code", importPath)
+	case "plugin":
+		return "", fmt.Errorf("%q cannot be imported from interpreted code: the plugin package is inaccessible to the interpreter", importPath)
+	}
+
 	if prepared := interp.srcPkgInit[importPath]; prepared != nil {
 		if prepared.phase == sourcePackageCommitted {
 			return prepared.pkgName, nil
