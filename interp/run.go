@@ -1827,7 +1827,11 @@ func genInterfaceWrapper(n *node, typ reflect.Type) func(*frame) reflect.Value {
 		if vi, ok := v.Interface().(valueInterface); ok {
 			n2 = vi.node
 		}
-		v = getConcreteValue(v)
+		// Keep the whole concrete value in the wrapper first field, so it can
+		// be retrieved intact by binary code reflecting over the wrapper (i.e.
+		// for marshalling) or by type assertions. Only valueInterface layers
+		// are unwrapped here.
+		v = valueInterfaceValue(v)
 		w := reflect.New(wrap).Elem()
 		w.Field(0).Set(v)
 		for i, m := range methods {
@@ -2313,13 +2317,31 @@ func callBin(n *node) {
 				}
 			}
 
+			// When the target parameter is an empty interface (and not a
+			// variadic slice of empty interfaces), pass the concrete value to
+			// the binary function rather than an interpreter interface wrapper,
+			// so binary code does not reflect over wrapper structs (see for
+			// example json.Marshal). Wrappers are preserved for non-empty
+			// interface parameters, where method dispatch matters, and for
+			// variadic parameters, where values are still re-wrapped at run
+			// time if necessary (see getBinValue).
+			unwrap := defType.Kind() == reflect.Interface && defType.NumMethod() == 0
+
 			switch {
 			case isEmptyInterface(c.typ):
+				if unwrap {
+					values = append(values, genValueConcrete(getMapType, c))
+					break
+				}
 				values = append(values, genValue(c))
 			case isInterfaceSrc(c.typ):
 				values = append(values, genValueInterfaceValue(c))
 			case isFuncSrc(c.typ):
 				values = append(values, genFunctionWrapper(c))
+			case unwrap && (c.typ.cat == arrayT || c.typ.cat == sliceT || c.typ.cat == variadicT) && isInterface(c.typ.val):
+				values = append(values, genValueArrayConcrete(c))
+			case unwrap && c.typ.cat == mapT && isInterface(c.typ.val):
+				values = append(values, genValueMapConcrete(c))
 			case c.typ.cat == arrayT || c.typ.cat == variadicT:
 				if isEmptyInterface(c.typ.val) {
 					values = append(values, genValueArray(c))
@@ -2333,8 +2355,16 @@ func callBin(n *node) {
 					values = append(values, genInterfaceWrapper(c, defType))
 				}
 			case c.typ.cat == valueT:
+				if unwrap {
+					values = append(values, genValueConcrete(getMapType, c))
+					break
+				}
 				values = append(values, genValue(c))
 			default:
+				if unwrap {
+					values = append(values, genValueConcrete(getMapType, c))
+					break
+				}
 				values = append(values, genInterfaceWrapper(c, defType))
 			}
 		}
