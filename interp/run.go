@@ -484,21 +484,26 @@ func runCfg(n *node, f *frame, funcNode, callNode *node) {
 		f.mutex.Lock()
 		recovered = f.recovered
 		f.mutex.Unlock()
-		// Revert the function literal slots when this frame exits. The restore
-		// is the only frame-cell writer in the activation-exit path, so it
-		// holds the funcSweep fence (read mode) like every step: the
-		// incremental sweep reads capture cells unfenced, trusting the fence
-		// for exclusivity against this write. (The closure invoker's own slot
-		// restore in buildClosureWrapper is a second, master-parity unfenced
-		// frame-cell writer; it predates this change and is not covered by
-		// this bracket.) The fence cannot be held here (the last step released
-		// it and the drain counters are closed), so the read lock is safe, and
-		// it is released by defer like every other fence bracket. Skipped when
-		// another activation shares this frame's cells through a lexical clone
-		// (a goroutine or closure activation whose cloneOf chain points at
-		// this frame): the shared cell may still be read through the clone,
-		// and such an entry simply stays sweep/purge reclaimable. Frames that
-		// executed no literal pay only the funcSlots check.
+		// Revert the function literal slots when this frame exits. This
+		// bracket's own restore is the only frame-cell write the exit code
+		// itself performs (the deferred drain can still reach the closure
+		// invoker's restore in buildClosureWrapper — a second, master-parity
+		// unfenced frame-cell writer this bracket does not cover), so the
+		// restore holds the funcSweep fence (read mode): the incremental
+		// sweep reads capture cells unfenced, trusting the fence for
+		// exclusivity against this write. The fence cannot be held here (the
+		// last step released it and the drain counters are closed), so the
+		// read lock is safe, and it is released by defer like every other
+		// fence bracket. Skipped when another activation shares this frame's
+		// cells through a lexical clone (a goroutine or closure activation
+		// whose cloneOf chain points at this frame): the shared cell may
+		// still be read through the clone, and such an entry simply stays
+		// sweep/purge reclaimable. Frames that executed no literal pay only
+		// the funcSlots check: the unlocked slice-header read below is safe
+		// because a frame's slots are written only by its own executing
+		// goroutine (getFunc runs as a step of the frame's single runCfg
+		// activation, and root frames never record), the same single-writer
+		// property the exec loop relies on for f.data.
 		if len(f.funcSlots) > 0 {
 			f.mutex.RLock()
 			pending := f.funcSlots
