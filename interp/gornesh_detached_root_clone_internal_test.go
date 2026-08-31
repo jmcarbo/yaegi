@@ -2666,8 +2666,8 @@ func TestGorneshOwnedChannelReceiveMatchesDeliveredToken(t *testing.T) {
 	i.registerOwnedValue(mapB, root)
 	callbackA := reflect.ValueOf(func() {})
 	callbackB := reflect.ValueOf(func() {})
-	keyA, _ := canonicalFuncValue(callbackA)
-	keyB, _ := canonicalFuncValue(callbackB)
+	keyA, _ := funcvalKeyOf(callbackA)
+	keyB, _ := funcvalKeyOf(callbackB)
 	groupA := &funcMetaGroup{root: root, version: 1}
 	groupB := &funcMetaGroup{root: root, version: 1}
 	i.funcMu.Lock()

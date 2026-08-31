@@ -61,13 +61,13 @@ func (b *callOwnerBinder) bind(v reflect.Value, hostBoundary bool) (reflect.Valu
 		target := reflect.ValueOf(v.Interface())
 		target = b.f.interp.activateDirectFuncFromExec(b.f, target, b.cancel)
 		typ := v.Type()
-		_, meta, interpreted := b.f.interp.lookupInterpretedFunc(target)
+		targetKey, meta, interpreted := b.f.interp.lookupInterpretedFunc(target)
 		if !interpreted {
 			return v, false
 		}
 		root, cancel := b.f.root, b.cancel
 		var bound reflect.Value
-		cacheKey := boundWrapperKey{target: target, root: root, cancel: cancel, typ: typ, hostBoundary: hostBoundary}
+		cacheKey := boundWrapperKey{target: targetKey, root: root, cancel: cancel, typ: typ, hostBoundary: hostBoundary}
 		if meta.group != nil {
 			b.f.interp.funcMu.RLock()
 			cached, cachedOK := meta.group.bound[cacheKey]
@@ -157,7 +157,7 @@ func activateDirectFuncValueFromExec(f *frame, value reflect.Value) reflect.Valu
 			return value
 		}
 		active := activateDirectFuncValueFromExec(f, value.Elem())
-		if sameCanonicalFuncValue(active, value.Elem()) {
+		if sameFuncvalKey(active, value.Elem()) {
 			return value
 		}
 		out := reflect.New(value.Type()).Elem()
@@ -484,6 +484,49 @@ func runCfg(n *node, f *frame, funcNode, callNode *node) {
 		f.mutex.Lock()
 		recovered = f.recovered
 		f.mutex.Unlock()
+		// Revert the function literal slots when this frame exits. This
+		// bracket's own restore is the only frame-cell write the exit code
+		// itself performs (the deferred drain can still reach the closure
+		// invoker's restore in buildClosureWrapper — a second, master-parity
+		// unfenced frame-cell writer this bracket does not cover), so the
+		// restore holds the funcSweep fence (read mode): the incremental
+		// sweep reads capture cells unfenced, trusting the fence for
+		// exclusivity against this write. The fence cannot be held here (the
+		// last step released it and the drain counters are closed), so the
+		// read lock is safe, and it is released by defer like every other
+		// fence bracket. Skipped when another activation shares this frame's
+		// cells through a lexical clone (a goroutine or closure activation
+		// whose cloneOf chain points at this frame): the shared cell may
+		// still be read through the clone, and such an entry simply stays
+		// sweep/purge reclaimable. Frames that executed no literal pay only
+		// the funcSlots check: the unlocked slice-header read below is safe
+		// because a frame's slots are written only by its own executing
+		// goroutine (getFunc runs as a step of the frame's single runCfg
+		// activation, and root frames never record), the same single-writer
+		// property the exec loop relies on for f.data.
+		if len(f.funcSlots) > 0 {
+			f.mutex.RLock()
+			pending := f.funcSlots
+			f.mutex.RUnlock()
+			if len(pending) > 0 {
+				f.interp.funcMu.Lock()
+				lastActivation := f.interp.activeFrames[f] <= 1
+				for active := range f.interp.activeFrames {
+					if active != f && frameSharesSlotsWith(active, f) {
+						lastActivation = false
+						break
+					}
+				}
+				f.interp.funcMu.Unlock()
+				if lastActivation {
+					func() {
+						f.interp.funcSweepMu.RLock()
+						defer f.interp.funcSweepMu.RUnlock()
+						applyFuncSlotRestores(f)
+					}()
+				}
+			}
+		}
 		// Deregister the activation only AFTER the full release sequence and
 		// BEFORE the repanic: while this frame's deferred calls drain —
 		// including a canceled worker's zombie phase, whose interpreted
@@ -2700,15 +2743,69 @@ func getFunc(n *node) {
 		build := buildClosureWrapper(n, fr, slotOwner, i, o, f.root, f.cancel, captureRefs)
 		fct := build.value
 		n.interp.registerInterpretedFuncWithRebinder(fct, build.invoke, build.rebind, f, build.captures)
-		n.interp.funcMu.Lock()
-		fr.funcCarrier, _ = canonicalFuncValue(fct)
-		n.interp.funcMu.Unlock()
+		if ref, ok := funcvalRefOf(fct); ok {
+			n.interp.funcMu.Lock()
+			fr.funcCarrier = ref.key
+			n.interp.funcMu.Unlock()
+		}
 
 		f.mutex.Lock()
 		slotOwner.data[i] = fct
+		// Keep the slot's pre-execution value for the exit-time restore, so a
+		// finished frame does not pin the wrapper in its slot. Root-frame slots
+		// are durable REPL storage, never restored.
+		if slotOwner != slotOwner.root {
+			recordFuncSlotRestoreLocked(f, slotOwner, i, o)
+		}
 		f.mutex.Unlock()
 
 		return next
+	}
+}
+
+// frameSharesSlotsWith reports whether the active activation a can reach
+// frames whose cells are shared with f: f itself (through ancestry), or a
+// lexical clone whose header copies f's cells (cloneOf == f). False
+// positives are safe: they only skip a slot restore, leaving the entry to
+// the sweep and purge reclamation paths.
+func frameSharesSlotsWith(a, f *frame) bool {
+	for current := a; current != nil; current = current.anc {
+		if current == f || current.cloneOf == f {
+			return true
+		}
+	}
+	return false
+}
+
+// recordFuncSlotRestoreLocked remembers the restore for a literal slot, once
+// per (slot, frame): later executions of the same literal overwrite the slot
+// but must not displace the original restore value. First-wins is sound
+// because nothing reads a literal slot between a second getFunc execution and
+// frame exit — every later read of the wrapper goes through the value
+// captured at its creation, and the exit restore only serves the registry's
+// weak eviction. The caller holds f.mutex.
+func recordFuncSlotRestoreLocked(f, slotOwner *frame, index int, value reflect.Value) {
+	for _, existing := range f.funcSlots {
+		if existing.owner == slotOwner && existing.index == index {
+			return
+		}
+	}
+	f.funcSlots = append(f.funcSlots, funcSlotRestore{owner: slotOwner, index: index, value: value})
+}
+
+// applyFuncSlotRestores reverts every literal slot recorded by this frame. It
+// runs when the frame's last runCfg activation exits: the frame is done
+// executing, so its slots must no longer pin wrappers against the registry's
+// weak eviction.
+func applyFuncSlotRestores(f *frame) {
+	f.mutex.Lock()
+	restores := f.funcSlots
+	f.funcSlots = nil
+	f.mutex.Unlock()
+	for _, restore := range restores {
+		restore.owner.mutex.Lock()
+		restore.owner.data[restore.index] = restore.value
+		restore.owner.mutex.Unlock()
 	}
 }
 
@@ -2769,7 +2866,7 @@ func buildClosureWrapper(n *node, captured, slotOwner *frame, slotIndex int, res
 			clonedRestore = c.cloneValue(restore, true)
 		}
 		build := buildClosureWrapper(n, clonedCaptured, clonedSlotOwner, slotIndex, clonedRestore, c.newRoot, c.cancel, captureRefs)
-		clonedCaptured.funcCarrier, _ = canonicalFuncValue(build.value)
+		clonedCaptured.funcCarrier, _ = funcvalKeyOf(build.value)
 		return build
 	}
 	return interpretedFuncBuild{
