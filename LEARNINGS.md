@@ -109,7 +109,19 @@
   package-level variables pin their wrappers, so PurgeRetainedFuncs remains
   the manual reclamation path; the weak registry removes the registry
   itself, its alias keys, and the bound-wrapper cache as independent
-  retainers. Isolation suites re-run green under -race.
+  retainers. Isolation suites re-run green under -race. Review follow-ups
+  (2026-08-31): the exit-time slot restore is the only frame-cell writer
+  outside an exec step, so it holds the funcSweep fence in read mode — the
+  incremental sweep's capture-cell reads are unfenced and trust the fence
+  for exclusivity — and it is skipped when another active activation
+  reaches the frame through ancestry or a cloneOf link (shared copied cell
+  headers keep master-like semantics for goroutine/recursive-closure
+  cases; such entries stay sweep/purge reclaimable). directFuncs
+  activations store their funcval key eagerly so eviction paths never
+  derive keys (an allocation) under funcMu. The funcval address-reuse
+  guard is belt-and-braces: the runtime never reuses a funcval address
+  before its finalizer has executed, so a stale finalizer and a fresh
+  registration cannot coexist at one key.
 - Reentrancy for the execution gate is an explicit token scoped to the
   goroutine running the execution, not a native stack probe: any goroutine
   running interpreted code has runCfg on its stack, including goroutines
