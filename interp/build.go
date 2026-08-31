@@ -19,7 +19,6 @@ func (interp *Interpreter) buildOk(ctx *build.Context, name, src string) (bool, 
 	if err != nil {
 		return false, err
 	}
-	setYaegiTags(ctx, f.Comments)
 
 	// A //go:build line, when present, supersedes any legacy // +build line.
 	sawGoBuild := false
@@ -52,6 +51,10 @@ func (interp *Interpreter) buildOk(ctx *build.Context, name, src string) (bool, 
 			}
 		}
 	}
+	// Only set yaegi tags for files that pass their own build constraints:
+	// a tag directive in an excluded file must not leak into the shared
+	// build context.
+	setYaegiTags(ctx, f.Comments)
 	return true, nil
 }
 

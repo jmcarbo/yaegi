@@ -667,6 +667,21 @@ func nodeType2(interp *Interpreter, sc *scope, n *node, seen []*node) (t *itype,
 				// The result type is the common type of the arguments, already
 				// unified (untyped args converted) by check.builtin.
 				t, err = nodeType2(interp, sc, n.child[1], seen)
+				if err != nil {
+					return nil, err
+				}
+				if t.untyped {
+					// Like binaryExpr, an untyped result takes the
+					// destination type when the context provides one.
+					switch a := n.anc; {
+					case a.kind == defineStmt && len(a.child) > a.nleft+a.nright:
+						if t, err = nodeType2(interp, sc, a.child[a.nleft], seen); err != nil {
+							return nil, err
+						}
+					case a.kind == returnStmt:
+						t = sc.def.typ.ret[childPos(n)]
+					}
+				}
 			case bltnAppend, bltnMake:
 				t, err = nodeType2(interp, sc, n.child[1], seen)
 			case bltnNew:
@@ -2541,6 +2556,11 @@ func isInterfaceBin(t *itype) bool {
 }
 
 func isInterface(t *itype) bool {
+	if t.incomplete {
+		// An incomplete type has no reflect type yet: resolving it here
+		// could panic. It is not known to be an interface.
+		return false
+	}
 	return isInterfaceSrc(t) || t.TypeOf() == valueInterfaceType || t.TypeOf() != nil && t.TypeOf().Kind() == reflect.Interface
 }
 
@@ -2572,6 +2592,11 @@ func isStruct(t *itype) bool {
 }
 
 func isConstType(t *itype) bool {
+	if t.incomplete {
+		// Not yet resolvable: report a non constant type rather than
+		// forcing the resolution of a forward declared type.
+		return false
+	}
 	rt := t.TypeOf()
 	return isBoolean(rt) || isString(rt) || isNumber(rt)
 }

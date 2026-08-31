@@ -4552,7 +4552,13 @@ func genMinMax(n *node, isMin bool) {
 				best = v
 			}
 		}
-		dest(f).Set(best)
+		d := dest(f)
+		// The destination cell type may be narrower than the untyped
+		// arguments' default type: convert before storing.
+		if !best.Type().AssignableTo(d.Type()) {
+			best = best.Convert(d.Type())
+		}
+		d.Set(best)
 		return next
 	}
 }
