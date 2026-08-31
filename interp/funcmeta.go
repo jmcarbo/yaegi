@@ -3,7 +3,148 @@ package interp
 import (
 	"reflect"
 	"runtime"
+	"unsafe"
 )
+
+// funcval mirrors the layout of a Go func value: a func variable stores the
+// address of a funcval, whose first word is the code pointer. The ADDRESS of
+// the funcval is the identity of the func value, and is what the registry is
+// keyed by.
+type funcval struct {
+	fn uintptr
+}
+
+// funcvalRef bundles the registry key of a func value with the typed funcval
+// pointer needed to arm its eviction finalizer.
+type funcvalRef struct {
+	key uintptr
+	ptr *funcval
+}
+
+// funcvalRefOf derives the funcval identity of the wrapper v: the address of
+// the funcval, read as the single word a func variable stores. This is the
+// same word reflect.Value comparison used by the previous canonical func
+// keys, so key semantics are preserved; the value itself is not retained.
+func funcvalRefOf(v reflect.Value) (funcvalRef, bool) {
+	if !v.IsValid() || v.Kind() != reflect.Func || v.IsNil() || !v.CanInterface() {
+		return funcvalRef{}, false
+	}
+	cell := reflect.New(v.Type())
+	cell.Elem().Set(v)
+	ptr := (*funcval)(*(*unsafe.Pointer)(cell.UnsafePointer()))
+	return funcvalRef{key: uintptr(unsafe.Pointer(ptr)), ptr: ptr}, true
+}
+
+// funcvalKeyOf derives only the registry key of the wrapper v.
+func funcvalKeyOf(v reflect.Value) (uintptr, bool) {
+	ref, ok := funcvalRefOf(v)
+	return ref.key, ok
+}
+
+// funcvalKey derives the registry key from an already canonical func value
+// (one produced by canonicalFuncValue, which guarantees a non-nil,
+// interfaceable func): its funcval address.
+func funcvalKey(canonical reflect.Value) uintptr {
+	cell := reflect.New(canonical.Type())
+	cell.Elem().Set(canonical)
+	return uintptr(*(*unsafe.Pointer)(cell.UnsafePointer()))
+}
+
+// sameFuncvalKey reports whether two func values share one funcval.
+func sameFuncvalKey(left, right reflect.Value) bool {
+	leftKey, leftOK := funcvalKeyOf(left)
+	rightKey, rightOK := funcvalKeyOf(right)
+	return leftOK && rightOK && leftKey == rightKey
+}
+
+// insertFuncMetaEntryLocked installs meta for ref.key in the registry,
+// guarding it with a generation counter so a finalizer armed for a dropped
+// wrapper can never evict a later registration that reused the address, and
+// arming that finalizer: when the wrapper becomes unreachable, the entry is
+// reclaimed without waiting for a manual purge. The caller holds funcMu.
+func (interp *Interpreter) insertFuncMetaEntryLocked(ref funcvalRef, meta interpretedFuncMeta, owner *frame) {
+	generation := uint64(0)
+	if old, ok := interp.funcMeta[ref.key]; ok {
+		generation = old.generation + 1
+	}
+	meta.generation = generation
+	interp.funcMeta[ref.key] = meta
+	if owner != nil {
+		owner.funcMeta = append(owner.funcMeta, ref.key)
+	}
+	// Sweeps and purges may have deleted the previous entry while its wrapper
+	// is still alive (e.g. a bound alias restored after a sweep); clearing the
+	// leftover finalizer is required before arming a new one. A finalizer can
+	// only be queued while no mutator holds the object, and the clear below
+	// requires holding ref.ptr, so at clear time any previous finalizer is at
+	// worst armed-not-queued and the clear fully cancels it. The generation
+	// counter stays as belt-and-braces against future lifetime changes.
+	runtime.SetFinalizer(ref.ptr, nil)
+	key := ref.key
+	runtime.SetFinalizer(ref.ptr, func(fv *funcval) {
+		// The closure captures only the interpreter, the key and the
+		// generation — never the wrapper or the typed funcval pointer — so
+		// arming the finalizer does not keep the wrapper alive.
+		//
+		// Invariant: ref.ptr must be the base of a heap funcval. Every
+		// registration path passes a reflect.MakeFunc product (heap
+		// makeFuncImpl), which SetFinalizer requires. A static funcval (a
+		// top-level func or a no-capture literal) lives in rodata, where
+		// SetFinalizer fatal-errors instead of no-op'ing — never route one
+		// through here.
+		interp.evictFuncMetaAtFinalizer(key, generation)
+	})
+}
+
+// evictFuncMetaAtFinalizer deletes the entry whose wrapper was dropped. It
+// runs on the finalizer goroutine, so it only takes funcMu: the wrapper is
+// provably unreachable at this point (no execution can look it up, no send,
+// capture cell, global or host reference retains it), so no funcSweep fence
+// participation is needed — the eviction cannot invalidate anything a running
+// execution or sweep is about to use.
+func (interp *Interpreter) evictFuncMetaAtFinalizer(key uintptr, generation uint64) {
+	interp.funcMu.Lock()
+	defer interp.funcMu.Unlock()
+	interp.evictFuncMetaKeyLocked(key, generation)
+}
+
+// evictFuncMetaKeyLocked deletes the registry entry for key if its generation
+// still matches, cleaning the owning frame's key list, the directFuncs cache
+// lines anchored at either endpoint, and the group's memoized host-bound
+// wrappers for the key. The caller holds funcMu.
+func (interp *Interpreter) evictFuncMetaKeyLocked(key uintptr, generation uint64) {
+	meta, ok := interp.funcMeta[key]
+	if !ok || meta.generation != generation {
+		return
+	}
+	delete(interp.funcMeta, key)
+	if meta.frame != nil {
+		removeFrameFuncMetaKeyLocked(meta.frame, key)
+	}
+	for activationKey, activation := range interp.directFuncs {
+		if activationKey.source == key || activation.key == key {
+			delete(interp.directFuncs, activationKey)
+		}
+	}
+	if meta.group != nil && len(meta.group.bound) > 0 {
+		for cacheKey := range meta.group.bound {
+			if cacheKey.target == key {
+				delete(meta.group.bound, cacheKey)
+			}
+		}
+	}
+}
+
+// removeFrameFuncMetaKeyLocked drops key from a frame's registration list.
+// The caller holds funcMu.
+func removeFrameFuncMetaKeyLocked(f *frame, key uintptr) {
+	for i, existing := range f.funcMeta {
+		if existing == key {
+			f.funcMeta = append(f.funcMeta[:i], f.funcMeta[i+1:]...)
+			return
+		}
+	}
+}
 
 type funcFrameState uint8
 
@@ -190,7 +331,7 @@ func (interp *Interpreter) rollbackInterpretedFuncPanicEscape(recovered interfac
 		return
 	}
 	interp.funcMu.RLock()
-	entries := make(map[reflect.Value]interpretedFuncMeta, len(interp.funcMeta))
+	entries := make(map[uintptr]interpretedFuncMeta, len(interp.funcMeta))
 	for key, meta := range interp.funcMeta {
 		entries[key] = meta
 	}
@@ -230,13 +371,13 @@ func (interp *Interpreter) markInterpretedFuncMetadataEscapedLocked(retention fu
 	}
 
 	interp.funcMu.RLock()
-	entries := make(map[reflect.Value]interpretedFuncMeta, len(interp.funcMeta))
+	entries := make(map[uintptr]interpretedFuncMeta, len(interp.funcMeta))
 	for key, meta := range interp.funcMeta {
 		entries[key] = meta
 	}
 	interp.funcMu.RUnlock()
 
-	escaped := map[reflect.Value]struct{}{}
+	escaped := map[uintptr]struct{}{}
 	for key := range entries {
 		if collector.exactContains(key) {
 			escaped[key] = struct{}{}
@@ -297,7 +438,7 @@ func (interp *Interpreter) releaseInterpretedFuncs(f *frame, funcNode *node, rec
 
 	interp.funcMu.Lock()
 	f.funcState = funcFrameReleasing
-	keys := append([]reflect.Value(nil), f.funcMeta...)
+	keys := append([]uintptr(nil), f.funcMeta...)
 	escape := f.funcEscape
 	interp.funcMu.Unlock()
 	if len(keys) == 0 {
@@ -305,7 +446,7 @@ func (interp *Interpreter) releaseInterpretedFuncs(f *frame, funcNode *node, rec
 		return
 	}
 
-	targets := make(map[reflect.Value]struct{}, len(keys))
+	targets := make(map[uintptr]struct{}, len(keys))
 	for _, key := range keys {
 		targets[key] = struct{}{}
 	}
@@ -446,17 +587,21 @@ func (interp *Interpreter) adoptInterpretedFuncValues(f *frame, source funcMetaR
 }
 
 func (interp *Interpreter) releaseOwnedChannelSendFuncsLocked(send *ownedChannelSend, funcs map[reflect.Value]struct{}, receivingRoot *frame, replaced bool) {
-	for key := range funcs {
+	for value := range funcs {
+		key, ok := funcvalKeyOf(value)
+		if !ok {
+			continue
+		}
 		usedElsewhere := false
 		for _, channel := range interp.ownedChannels {
 			for _, other := range channel.sends {
 				if other == send || other.state == ownedChannelSendTerminal {
 					continue
 				}
-				if _, ok := other.funcs[key]; ok {
+				if _, ok := other.funcs[value]; ok {
 					usedElsewhere = true
 				}
-				if _, ok := other.pendingFuncs[key]; ok {
+				if _, ok := other.pendingFuncs[value]; ok {
 					usedElsewhere = true
 				}
 			}
@@ -513,7 +658,7 @@ func (interp *Interpreter) adoptInterpretedFuncValuesLocked(f *frame, source fun
 
 func (interp *Interpreter) adoptInterpretedFuncMetadataValuesLocked(f *frame, source funcMetaRetention, values ...reflect.Value) []reflect.Value {
 	interp.funcMu.RLock()
-	entries := make(map[reflect.Value]interpretedFuncMeta, len(interp.funcMeta))
+	entries := make(map[uintptr]interpretedFuncMeta, len(interp.funcMeta))
 	for key, meta := range interp.funcMeta {
 		eligible := meta.retention == source
 		if meta.frame != nil && meta.frame != meta.frame.root {
@@ -530,7 +675,7 @@ func (interp *Interpreter) adoptInterpretedFuncMetadataValuesLocked(f *frame, so
 		if meta.group == nil {
 			continue
 		}
-		visitor := funcValueVisitor{targets: map[reflect.Value]struct{}{key: {}}}
+		visitor := funcValueVisitor{targets: map[uintptr]struct{}{key: {}}}
 		for _, value := range values {
 			if visitor.contains(value) {
 				groups[meta.group] = struct{}{}
@@ -621,7 +766,7 @@ func (interp *Interpreter) preserveReturnedInterpretedFuncsLocked(value reflect.
 		return
 	}
 	interp.funcMu.RLock()
-	entries := make(map[reflect.Value]interpretedFuncMeta, len(interp.funcMeta))
+	entries := make(map[uintptr]interpretedFuncMeta, len(interp.funcMeta))
 	for key, meta := range interp.funcMeta {
 		entries[key] = meta
 	}
@@ -714,6 +859,11 @@ func (interp *Interpreter) preservePossiblyReturnedInterpretedFuncs(result refle
 // a later cancel/detach its writes land in the abandoned root and lose
 // channel-ownership tracking.
 //
+// Entries whose wrapper the host dropped entirely are reclaimed automatically
+// by the registry's weak finalizers; the purge handles wrappers the host
+// retains or that remain pinned by interpreter-side cells (e.g. the last Eval
+// result stored in a root frame cell).
+//
 // WARNING: do not call from interpreted code, from a host callback of a
 // running evaluation, or while paused under the debugger. Called from an
 // unrelated goroutine it blocks until evaluations quiesce.
@@ -725,13 +875,14 @@ func (interp *Interpreter) PurgeRetainedFuncs() int {
 	root := interp.frame
 	interp.mutex.RUnlock()
 
-	// Group-scoped snapshot: lookupInterpretedFunc's convertible-type fallback
-	// would resurrect a key-scoped purge through an alias sharing meta.group,
-	// so candidates, members, and eligibility are tracked per group. Groups
-	// pinned by undelivered channel sends or live panic tokens are skipped.
+	// Group-scoped snapshot: aliases share meta.group, and a purge scoped to
+	// single keys could be resurrected through an alias's convertible-type
+	// lookup, so candidates, members, and eligibility are tracked per group.
+	// Groups pinned by undelivered channel sends or live panic tokens are
+	// skipped.
 	interp.funcMu.RLock()
-	candidates := map[reflect.Value]interpretedFuncMeta{}
-	groupMembers := map[*funcMetaGroup][]reflect.Value{}
+	candidates := map[uintptr]interpretedFuncMeta{}
+	groupMembers := map[*funcMetaGroup][]uintptr{}
 	groupCaptures := map[*funcMetaGroup][]funcMetaCapture{}
 	groupVersions := map[*funcMetaGroup]uint64{}
 	eligible := map[*funcMetaGroup]bool{}
@@ -841,7 +992,7 @@ func (interp *Interpreter) PurgeRetainedFuncs() int {
 	}
 
 	removed := 0
-	deletedKeys := map[reflect.Value]struct{}{}
+	deletedKeys := map[uintptr]struct{}{}
 	affectedFrames := map[*frame]struct{}{}
 	interp.funcMu.Lock()
 	for group, isEligible := range eligible {
@@ -877,13 +1028,12 @@ func (interp *Interpreter) PurgeRetainedFuncs() int {
 	// Drop directFuncs activations whose source or cloned value lost its
 	// metadata: such an entry can never again resolve to discoverable
 	// metadata, and keeping either endpoint would anchor the other forever.
-	for key, value := range interp.directFuncs {
-		valueKey, ok := canonicalFuncValue(value)
-		if !ok {
+	for key, activation := range interp.directFuncs {
+		if activation.key == 0 {
 			continue
 		}
 		if _, deleted := deletedKeys[key.source]; !deleted {
-			if _, deleted := deletedKeys[valueKey]; !deleted {
+			if _, deleted := deletedKeys[activation.key]; !deleted {
 				continue
 			}
 		}
@@ -948,7 +1098,7 @@ func (interp *Interpreter) sweepRootInterpretedFuncs(root *frame, result reflect
 	interp.preserveReturnedInterpretedFuncsLocked(result)
 
 	interp.funcMu.RLock()
-	candidates := map[reflect.Value]interpretedFuncMeta{}
+	candidates := map[uintptr]interpretedFuncMeta{}
 	groupCaptures := map[*funcMetaGroup][]funcMetaCapture{}
 	groupVersions := map[*funcMetaGroup]uint64{}
 	directValues := []reflect.Value{}
@@ -963,9 +1113,9 @@ func (interp *Interpreter) sweepRootInterpretedFuncs(root *frame, result reflect
 			}
 		}
 	}
-	for key, value := range interp.directFuncs {
+	for key, activation := range interp.directFuncs {
 		if key.root == root {
-			directValues = append(directValues, value)
+			directValues = append(directValues, activation.value)
 		}
 	}
 	interp.funcMu.RUnlock()
@@ -1017,7 +1167,7 @@ func (interp *Interpreter) sweepRootInterpretedFuncs(root *frame, result reflect
 					if _, live := liveGroups[meta.group]; live {
 						continue
 					}
-					visitor := funcValueVisitor{targets: map[reflect.Value]struct{}{key: {}}}
+					visitor := funcValueVisitor{targets: map[uintptr]struct{}{key: {}}}
 					if visitor.possiblyContains(value) {
 						liveGroups[meta.group] = struct{}{}
 						changed = true
@@ -1055,7 +1205,7 @@ func snapshotFuncMetaCapture(capture funcMetaCapture) (reflect.Value, bool) {
 	return snapshot, true
 }
 
-func (interp *Interpreter) deleteUnreachableRootFuncMeta(root *frame, candidates map[reflect.Value]interpretedFuncMeta, liveGroups map[*funcMetaGroup]struct{}, groupVersions map[*funcMetaGroup]uint64) {
+func (interp *Interpreter) deleteUnreachableRootFuncMeta(root *frame, candidates map[uintptr]interpretedFuncMeta, liveGroups map[*funcMetaGroup]struct{}, groupVersions map[*funcMetaGroup]uint64) {
 	interp.funcMu.Lock()
 	for key, candidate := range candidates {
 		meta, ok := interp.funcMeta[key]
@@ -1078,7 +1228,7 @@ func (interp *Interpreter) deleteUnreachableRootFuncMeta(root *frame, candidates
 	interp.funcMu.Unlock()
 }
 
-func frameReturnsFunction(f *frame, funcNode *node, targets map[reflect.Value]struct{}) bool {
+func frameReturnsFunction(f *frame, funcNode *node, targets map[uintptr]struct{}) bool {
 	if funcNode == nil || funcNode.typ == nil {
 		return false
 	}
@@ -1095,7 +1245,7 @@ func frameReturnsFunction(f *frame, funcNode *node, targets map[reflect.Value]st
 	return false
 }
 
-func funcsReachableFromAncestors(f *frame, targets map[reflect.Value]struct{}) *frame {
+func funcsReachableFromAncestors(f *frame, targets map[uintptr]struct{}) *frame {
 	seenFrames := map[*frame]struct{}{}
 	for ancestor := f.anc; ancestor != nil; ancestor = ancestor.anc {
 		if funcsReachableFromFrame(ancestor, targets, seenFrames) {
@@ -1108,7 +1258,7 @@ func funcsReachableFromAncestors(f *frame, targets map[reflect.Value]struct{}) *
 	return nil
 }
 
-func funcsReachableFromFrame(f *frame, targets map[reflect.Value]struct{}, seenFrames map[*frame]struct{}) bool {
+func funcsReachableFromFrame(f *frame, targets map[uintptr]struct{}, seenFrames map[*frame]struct{}) bool {
 	if f == nil {
 		return false
 	}
@@ -1121,7 +1271,7 @@ func funcsReachableFromFrame(f *frame, targets map[reflect.Value]struct{}, seenF
 		_, carrierRegistered := f.interp.funcMeta[f.funcCarrier]
 		cloneOwnerFinished := f.cloneOf.funcState == funcFrameFinished
 		f.interp.funcMu.RUnlock()
-		if cloneOwnerFinished && !carrierRegistered {
+		if f.funcCarrier != 0 && cloneOwnerFinished && !carrierRegistered {
 			// The only remaining owner of this clone is its currently executing
 			// wrapper. Once that call unwinds, values reachable only through the
 			// clone cannot escape and must not be promoted to the root.
@@ -1142,7 +1292,7 @@ func funcsReachableFromFrame(f *frame, targets map[reflect.Value]struct{}, seenF
 }
 
 type funcValueVisitor struct {
-	targets map[reflect.Value]struct{}
+	targets map[uintptr]struct{}
 }
 
 type funcValueMatch uint8
@@ -1179,7 +1329,7 @@ func (v *funcValueVisitor) match(value reflect.Value) funcValueMatch {
 		if value.IsNil() {
 			return funcValueNoMatch
 		}
-		key, ok := canonicalFuncValue(value)
+		key, ok := funcvalKeyOf(value)
 		if !ok {
 			return funcValueAmbiguousMatch
 		}
@@ -1286,26 +1436,27 @@ func funcBearingValue(value reflect.Value) bool {
 	return typeMayContainFunc(typ, map[reflect.Type]bool{})
 }
 
-// funcValueCollector gathers the exact canonical function values reachable
-// through a value graph and records whether an ambiguous func-capable
-// container was crossed. Traversal mirrors funcValueVisitor.match: boxed and
-// interface values are unwrapped, structs and arrays are descended when their
-// type may contain a function, and non-nil pointers, slices, and maps are
-// never read recursively (native code may retain and mutate them while an
-// interpreted call is canceled), so they only set anyAmbiguous.
+// funcValueCollector gathers the exact function values reachable through a
+// value graph, keyed by funcval identity, and records whether an ambiguous
+// func-capable container was crossed. Traversal mirrors
+// funcValueVisitor.match: boxed and interface values are unwrapped, structs
+// and arrays are descended when their type may contain a function, and
+// non-nil pointers, slices, and maps are never read recursively (native code
+// may retain and mutate them while an interpreted call is canceled), so they
+// only set anyAmbiguous.
 type funcValueCollector struct {
-	exact        map[reflect.Value]struct{}
+	exact        map[uintptr]struct{}
 	anyAmbiguous bool
 }
 
 func newFuncValueCollector() *funcValueCollector {
-	return &funcValueCollector{exact: map[reflect.Value]struct{}{}}
+	return &funcValueCollector{exact: map[uintptr]struct{}{}}
 }
 
-// exactContains reports whether the canonical function value key was found in
-// the collected graph. A candidate is live iff exactContains or anyAmbiguous,
-// which reproduces funcValueVisitor.possiblyContains.
-func (c *funcValueCollector) exactContains(key reflect.Value) bool {
+// exactContains reports whether the funcval key was found in the collected
+// graph. A candidate is live iff exactContains or anyAmbiguous, which
+// reproduces funcValueVisitor.possiblyContains.
+func (c *funcValueCollector) exactContains(key uintptr) bool {
 	_, ok := c.exact[key]
 	return ok
 }
@@ -1330,7 +1481,7 @@ func (c *funcValueCollector) collect(value reflect.Value) {
 		if value.IsNil() {
 			return
 		}
-		key, ok := canonicalFuncValue(value)
+		key, ok := funcvalKeyOf(value)
 		if !ok {
 			c.anyAmbiguous = true
 			return

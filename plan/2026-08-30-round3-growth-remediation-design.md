@@ -182,7 +182,7 @@ goroutines (frame retention, no registry). REPL accumulation in interp.roots
 PR-introduced overheads: ~10-12% retained bytes per REPL Eval (larger per-root
 AST/exec metadata), and the func-leading slot regression below.
 
-## Func-leading REPL Eval slot growth — finding + dead ends (OPEN)
+## Func-leading REPL Eval slot growth — finding + dead ends (RESOLVED 2026-08-30)
 
 Finding (probe-verified): an incremental Eval beginning with `func` (bare
 literal or IIFE) permanently adds +1..+3 global-frame slots on this branch
@@ -190,7 +190,8 @@ literal or IIFE) permanently adds +1..+3 global-frame slots on this branch
 retry returned the synthetic-main FuncDecl (function scope, no global slots)
 but replayed it on every later Eval; the PR's anti-replay fix returns the
 wrapper BODY (ast.go ~619), compiling the statements in the global scope where
-`case funcLit: n.findex = sc.add(n.typ)` (cfg.go ~574) permanently extends the
+`case funcLit: n.findex = sc.add(n.typ)` (cfg.go ~583, the else branch of the
+isRootImmediateFuncLit gate) permanently extends the
 global frame.
 
 Dead ends (attempted and reverted): (a) wrapping the body in a one-shot void
@@ -202,6 +203,43 @@ synthesized outer function of the inner's type — same slot count, same void
 breakage. Sound fixes require one of: codegen for immediately-called funcLits
 without a registry slot; transient/recycled slot storage for root-level
 literal entrypoints (must be goroutine-safe under `go`); or the scheduler-
-level one-shot FuncDecl design the PR explicitly rejected. Left as a
-documented open item: severity is REPL-shaped (thousands of func-Evals on one
-interpreter), master-compatible behavior otherwise preserved.
+level one-shot FuncDecl design the PR explicitly rejected.
+
+IMPLEMENTED 2026-08-30 — the chosen direction, direct-activation codegen
+(interp/cfg.go isRootImmediateFuncLit + interp/gornesh_root_iife_slot_
+internal_test.go): a callExpr whose function is a funcLit, compiled at
+global frame level (sc.global, propagated by pushBloc through root-level
+control bodies) and not under defer, compiles to a direct activation. The
+literal allocates no value slot (n.findex = notInFrame, n.val = n via the
+funcDecl fallthrough, gen = nop), the call skips the vestigial aGetFunc
+sc.add and the call-func snapshot, and at runtime genValue returns the
+*node value whose rval is invalid, so run.go call takes the existing
+declared-function activation path. defer-wrapped literals keep the wrapper
+path. Measured: void IIFEs add 0 slots per Eval (was +2); result IIFEs add
+only the ordinary call-expression result slot (was +3), matching any other
+root-level call such as `len("ab")` (+1/Eval on master and this branch —
+the pre-existing expression-slot mechanism whose cells also pin their
+results; PurgeRetainedFuncs remains their manual reclamation path).
+Transient slot recycling remains rejected (root-frame slots are reachable
+by goroutine-safe code paths), and the scheduler-level one-shot
+declaration remains rejected.
+
+## Weak funcval-keyed registry — IMPLEMENTED 2026-08-30
+
+The F2 long-term fix (LEARNINGS "Known growth boundary: interpreted
+function values that cross the Eval API") landed as the recorded full
+keying rework: registry keys are funcval addresses (the word a func
+variable stores — identical identity to the old canonical reflect.Value
+keys), every consumer moved to the pointer domain (lookup, walks and
+collectors, purge, root sweeps, frame key lists, directFuncs source keys,
+cloner snapshot maps, bound-wrapper cache keys), one entry per funcval
+storing its registered reflect.Type, and each insertion arms a
+SetFinalizer-based eviction guarded by a per-entry generation counter.
+Load-bearing implementation hazards (all recorded in LEARNINGS): the
+finalizer closure must capture scalars only (capturing the funcvalRef
+keeps the wrapper alive); the payload's own retention edges were broken by
+restoring literal slots at last-activation exit (root slots exempt — they
+are durable REPL storage) and by keying funcCarrier; arming requires the
+wrapper to still be live. Result-cell and package-variable retention
+remain (master parity, purge-reclaimable); the registry, its alias keys,
+and the bound-wrapper cache are no longer independent retainers.
