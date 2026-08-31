@@ -34,8 +34,10 @@ func main() {
 	fmt.Println(harness633.TypeOf(P))
 	fmt.Println(harness633.Marshal(S))
 	fmt.Println(harness633.Marshal(P))
-	fmt.Println(harness633.Marshal([]fmt.Stringer{S, P}))
-	fmt.Println(harness633.Marshal(map[string]fmt.Stringer{"k": S}))
+	// Containers of interface-held interpreted values are passed untouched:
+	// in-place mutation contracts (sort.Slice) take priority over marshaling,
+	// which fails loudly instead of corrupting data.
+	fmt.Println(harness633.MarshalErr([]fmt.Stringer{S}))
 
 	// Binary function taking a non-empty interface parameter: the interpreted
 	// method must still be dispatched.
@@ -62,6 +64,13 @@ func TestUpstream633(t *testing.T) {
 			return string(b)
 		}),
 		"String": reflect.ValueOf(func(v fmt.Stringer) string { return v.String() }),
+		"MarshalErr": reflect.ValueOf(func(v interface{}) string {
+			_, err := json.Marshal(v)
+			if err != nil {
+				return "marshal error: " + err.Error()
+			}
+			return "no error"
+		}),
 	}})
 
 	if _, err := i.Eval(upstream633Src); err != nil {
@@ -69,14 +78,13 @@ func TestUpstream633(t *testing.T) {
 	}
 
 	want := strings.Join([]string{
-		"struct { B string }",   // TypeOf(S)
-		"*struct { B string }",  // TypeOf(P)
-		`{"B":"v"}`,             // Marshal(S)
-		`{"B":"p"}`,             // Marshal(P)
-		`[{"B":"v"},{"B":"p"}]`, // Marshal([]fmt.Stringer{...})
-		`{"k":{"B":"v"}}`,       // Marshal(map[string]fmt.Stringer{...})
-		"A<v> A<p>",             // String(S), String(P)
-		"v p",                   // concrete value behind wrapper intact
+		"struct { B string }",  // TypeOf(S)
+		"*struct { B string }", // TypeOf(P)
+		`{"B":"v"}`,            // Marshal(S)
+		`{"B":"p"}`,            // Marshal(P)
+		"marshal error: json: unsupported type: func() string", // containers pass through untouched
+		"A<v> A<p>", // String(S), String(P)
+		"v p",       // concrete value behind wrapper intact
 	}, "\n")
 	if got := strings.TrimSpace(stdout.String()); got != want {
 		t.Fatalf("got %q, want %q", got, want)

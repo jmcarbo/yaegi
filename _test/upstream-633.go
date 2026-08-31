@@ -19,14 +19,13 @@ func main() {
 	jp, errp := json.Marshal(p)
 	fmt.Println(string(jp), errp)
 
-	// Slices and maps of interface-held values.
-	sl := []fmt.Stringer{A{B: "1"}, &A{B: "2"}}
-	jsl, errsl := json.Marshal(sl)
-	fmt.Println(string(jsl), errsl)
-
-	mp := map[string]fmt.Stringer{"k": A{B: "m"}}
-	jmp, errmp := json.Marshal(mp)
-	fmt.Println(string(jmp), errmp)
+	// Slices and maps of interface-held interpreted values are passed to
+	// binary code untouched: in-place mutation contracts (sort.Slice) take
+	// priority, so marshaling them remains unsupported (loud error, as
+	// before the concrete-argument change).
+	sl := []fmt.Stringer{A{B: "1"}}
+	_, errsl := json.Marshal(sl)
+	fmt.Println("slice marshal err:", errsl != nil)
 
 	// Unmarshal into an empty interface variable.
 	var x interface{}
@@ -40,7 +39,6 @@ func main() {
 // Output:
 // {"B":"v"} <nil>
 // {"B":"p"} <nil>
-// [{"B":"1"},{"B":"2"}] <nil>
-// {"k":{"B":"m"}} <nil>
+// slice marshal err: true
 // map[B:u] <nil>
 // A<v> A<p>

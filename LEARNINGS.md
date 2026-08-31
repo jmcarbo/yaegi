@@ -165,21 +165,25 @@
 - Binary calls whose parameter is exactly `interface{}` (non-variadic) pass
   the concrete underlying value, with valueInterface boxes and generated
   interface wrapper structs (`IValue` + `W*` func fields) unwrapped at the
-  call boundary (scalar; slices/maps copied only when an element is wrapped,
-  so in-place mutation by binary code is preserved for unwrapped elements).
-  This is what lets encoding/json reflect over interpreted values held in
-  non-empty interfaces (#633). Method dispatch is unchanged where it matters:
-  non-empty interface parameters keep wrappers, variadic `...any` (fmt
-  family) still re-wraps at run time via getBinValue/mapTypes, and a
-  valueInterface whose node matches the caller's mapTypes (json.Marshaler for
-  json.Marshal) is wrapped instead of unwrapped. Accepted trade-off: a value
-  that crossed a binary `any` boundary is stored concrete, so a later
-  interpreted type assertion to a NON-empty interface on it fails for
-  wrapper-less interpreted dynamic types (concrete assertions now succeed, as
-  natively). The interface wrapper constructor also stores the whole concrete
-  value in the wrapper first field (only valueInterface layers are stripped),
-  so `ifaceVar.(Concrete)` works and wrappers marshal to the full struct.
-  Residual: per-element Marshaler dispatch for slices of marshaler-bearing
-  structs (#1486) is untouched, and MarshalJSON behind a binary-interface
-  variable is not invoked (the wrapper carries no node, so mapTypes cannot
-  match the concrete type).
+  call boundary. Scalars only: slices/maps/arrays are passed untouched — a
+  copy would silently break in-place mutation contracts (sort.Slice sorts a
+  copy; observed as silent no-op sorting) and change the container's dynamic
+  type seen by host type assertions. This is what lets encoding/json reflect
+  over interpreted values held in non-empty interfaces (#633, scalar shape).
+  Method dispatch is unchanged where it matters: non-empty interface
+  parameters keep wrappers, variadic `...any` (fmt family) still re-wraps at
+  run time via getBinValue/mapTypes, and a valueInterface whose node matches
+  the caller's mapTypes (json.Marshaler for json.Marshal) is wrapped instead
+  of unwrapped. Wrapper-shape recognition (`IValue` + only func fields)
+  additionally requires an anonymous run-time type or an extract-style name
+  starting with `_`, so a user struct that happens to have that field shape
+  is never unwrapped. Accepted trade-offs: a value that crossed a binary
+  `any` boundary is stored concrete, so a later interpreted type assertion
+  to a NON-empty interface on it fails for wrapper-less interpreted dynamic
+  types (concrete assertions now succeed, as natively); containers of
+  interface-held interpreted values do not marshal (loud
+  "unsupported type: func()" error, unchanged from before the concrete-
+  argument change); per-element Marshaler dispatch for slices of
+  marshaler-bearing structs (#1486) is untouched. Note (verified by review):
+  json.Marshal of a value held in a json.Marshaler variable DOES dispatch to
+  MarshalJSON — the mapTypes match works there.

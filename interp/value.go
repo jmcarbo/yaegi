@@ -3,6 +3,7 @@ package interp
 import (
 	"go/constant"
 	"reflect"
+	"strings"
 )
 
 const (
@@ -302,6 +303,13 @@ func isInterfaceWrapperType(t reflect.Type) bool {
 		t.Field(0).Name != "IValue" || t.Field(0).Type.Kind() != reflect.Interface {
 		return false
 	}
+	// Only interpreter generated wrapper types are recognized: they are
+	// anonymous (built at run time via reflect.StructOf) or named by the
+	// extract tool with a leading underscore. A user type with the same
+	// field shape must not be unwrapped.
+	if name := t.Name(); name != "" && !strings.HasPrefix(name, "_") {
+		return false
+	}
 	for i := 1; i < t.NumField(); i++ {
 		if t.Field(i).Type.Kind() != reflect.Func {
 			return false
@@ -381,74 +389,6 @@ func genValueConcrete(getMapType func(*itype) reflect.Type, n *node) func(*frame
 			}
 		}
 		return unwrapInterfaceValue(v)
-	}
-}
-
-// genValueArrayConcrete is like genValueConcrete for array and slice values. If
-// at least one element carries an interpreter interface wrapper, a copy of the
-// sequence with unwrapped elements is returned; otherwise the original value is
-// returned untouched, so binary code can still mutate it in place.
-func genValueArrayConcrete(n *node) func(*frame) reflect.Value {
-	value := genValue(n)
-
-	return func(f *frame) reflect.Value {
-		v := value(f)
-		if v.Kind() == reflect.Ptr {
-			v = v.Elem()
-		}
-		if !v.IsValid() || v.Kind() != reflect.Slice && v.Kind() != reflect.Array {
-			return v
-		}
-		if v.Kind() == reflect.Slice && v.IsNil() {
-			return v
-		}
-		wrapped := false
-		for i := 0; i < v.Len(); i++ {
-			if isWrappedInterfaceValue(v.Index(i)) {
-				wrapped = true
-				break
-			}
-		}
-		if !wrapped {
-			return v
-		}
-		out := reflect.MakeSlice(reflect.SliceOf(emptyInterfaceType), v.Len(), v.Len())
-		for i := 0; i < v.Len(); i++ {
-			out.Index(i).Set(unwrapInterfaceValue(v.Index(i)))
-		}
-		return out
-	}
-}
-
-// genValueMapConcrete is like genValueConcrete for map values. If at least one
-// value carries an interpreter interface wrapper, a copy of the map with
-// unwrapped values is returned; otherwise the original value is returned
-// untouched, so binary code can still mutate it in place.
-func genValueMapConcrete(n *node) func(*frame) reflect.Value {
-	value := genValue(n)
-
-	return func(f *frame) reflect.Value {
-		v := value(f)
-		if !v.IsValid() || v.Kind() != reflect.Map || v.IsNil() {
-			return v
-		}
-		wrapped := false
-		iter := v.MapRange()
-		for iter.Next() {
-			if isWrappedInterfaceValue(iter.Value()) {
-				wrapped = true
-				break
-			}
-		}
-		if !wrapped {
-			return v
-		}
-		out := reflect.MakeMap(reflect.MapOf(v.Type().Key(), emptyInterfaceType))
-		iter = v.MapRange()
-		for iter.Next() {
-			out.SetMapIndex(iter.Key(), unwrapInterfaceValue(iter.Value()))
-		}
-		return out
 	}
 }
 

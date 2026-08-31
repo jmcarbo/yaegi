@@ -2374,12 +2374,48 @@ func (t *itype) implements(it *itype) bool {
 		if m, _ := t.lookupMethod(name); m != nil {
 			continue
 		}
-		if _, _, _, ok := t.lookupBinMethod(name); ok {
+		if _, _, _, ok := t.lookupBinMethod(name); ok && t.binPromotedMethodInSet(name, t.cat == ptrT) {
 			continue
 		}
 		return false
 	}
 	return true
+}
+
+// binPromotedMethodInSet reports whether the method name is in the method set
+// of t, considering promoted methods from embedded binary fields. viaPtr
+// tracks whether the path from the original receiver crossed a pointer
+// (receiver or embedded pointer field), in which case pointer-receiver
+// methods are part of the method set.
+func (t *itype) binPromotedMethodInSet(name string, viaPtr bool) bool {
+	if t.cat == ptrT {
+		return t.val.binPromotedMethodInSet(name, true)
+	}
+	for _, f := range t.field {
+		if !f.embed {
+			continue
+		}
+		if f.typ.cat == ptrT {
+			if f.typ.val.binPromotedMethodInSet(name, true) {
+				return true
+			}
+			continue
+		}
+		if f.typ.binPromotedMethodInSet(name, viaPtr) {
+			return true
+		}
+	}
+	rt := t.TypeOf()
+	if rt == nil {
+		return false
+	}
+	if _, ok := rt.MethodByName(name); ok {
+		return true
+	}
+	if _, ok := reflect.PtrTo(rt).MethodByName(name); ok {
+		return viaPtr
+	}
+	return false
 }
 
 // defaultType returns the default type of an untyped type.

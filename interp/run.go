@@ -1716,6 +1716,9 @@ func buildDeclaredFunctionWrapper(n, def *node, base *frame, receiver reflect.Va
 				arg = unboundMethodReceiver(n, arg, d[i].Kind())
 			}
 			typ := argTypes[i]
+			// Note: for an unbound wrapper, argTypes was built with the
+			// receiver prepended, so argTypes[i] is the type of the same
+			// argument as d[i] (the receiver at position 0).
 			switch {
 			case isEmptyInterface(typ) || typ.TypeOf() == valueInterfaceType:
 				d[i].Set(arg)
@@ -2371,10 +2374,6 @@ func callBin(n *node) {
 				values = append(values, genValueInterfaceValue(c))
 			case isFuncSrc(c.typ):
 				values = append(values, genFunctionWrapper(c))
-			case unwrap && (c.typ.cat == arrayT || c.typ.cat == sliceT || c.typ.cat == variadicT) && isInterface(c.typ.val):
-				values = append(values, genValueArrayConcrete(c))
-			case unwrap && c.typ.cat == mapT && isInterface(c.typ.val):
-				values = append(values, genValueMapConcrete(c))
 			case c.typ.cat == arrayT || c.typ.cat == variadicT:
 				if isEmptyInterface(c.typ.val) {
 					values = append(values, genValueArray(c))

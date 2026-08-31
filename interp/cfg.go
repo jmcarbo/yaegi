@@ -2461,6 +2461,12 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 			case n.anc.kind == assignStmt && n.anc.action == aAssign && n.anc.nright == 1:
 				dest := n.anc.child[childPos(n)-n.anc.nright]
 				n.typ = dest.typ
+				if isBinPkgVar(dest) {
+					// A binary package variable has no frame location: allocate a
+					// temporary, the assignment will Set the live destination cell.
+					n.findex = sc.add(n.typ)
+					break
+				}
 				n.findex = dest.findex
 				n.level = dest.level
 			case n.anc.kind == returnStmt:
@@ -3512,6 +3518,14 @@ func matchSelectorMethod(sc *scope, n *node) (err error) {
 	if m, lind := n.typ.lookupMethod(name); m != nil {
 		n.action = aGetMethod
 		if n.child[0].isType(sc) {
+			// A pointer-receiver method can only be referenced through a
+			// pointer type base (native Go: invalid method expression). The
+			// check applies to the declared method itself only: a promoted
+			// method follows the embedding chain rules.
+			if len(lind) == 0 && isPtrRecvMethod(m) && n.child[0].typ != nil && n.child[0].typ.cat != ptrT {
+				return n.cfgErrorf("invalid method expression %s.%s (needs pointer receiver (*%s).%s)",
+					n.child[0].typ.id(), name, n.child[0].typ.id(), name)
+			}
 			// Handle method as a function with receiver in 1st argument.
 			// The method expression is a func value: the receiver is not
 			// bound, it is provided at call time as first argument (#1499).
@@ -3680,4 +3694,13 @@ func isShiftCountOf(n *node) bool {
 		a = a.anc
 	}
 	return n.anc != nil && isShiftNode(n.anc) && len(n.anc.child) > 1 && n.anc.child[1] == n
+}
+
+// isPtrRecvMethod reports whether the method declaration node m declares a
+// pointer receiver (func (t *T) M(...)).
+func isPtrRecvMethod(m *node) bool {
+	if len(m.child) == 0 || m.child[0].kind != fieldList || len(m.child[0].child) == 0 {
+		return false
+	}
+	return m.child[0].child[0].lastChild().kind == starExpr
 }
