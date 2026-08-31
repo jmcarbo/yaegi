@@ -663,6 +663,10 @@ func nodeType2(interp *Interpreter, sc *scope, n *node, seen []*node) (t *itype,
 				}
 			case bltnCap, bltnCopy, bltnLen:
 				t = sc.getType("int")
+			case bltnMin, bltnMax:
+				// The result type is the common type of the arguments, already
+				// unified (untyped args converted) by check.builtin.
+				t, err = nodeType2(interp, sc, n.child[1], seen)
 			case bltnAppend, bltnMake:
 				t, err = nodeType2(interp, sc, n.child[1], seen)
 			case bltnNew:
@@ -1346,7 +1350,7 @@ func (t *itype) numOut() int {
 		}
 	case builtinT:
 		switch t.name {
-		case "append", "cap", "complex", "copy", "imag", "len", "make", "new", "real", "recover", "unsafe.Alignof", "unsafe.Offsetof", "unsafe.Sizeof":
+		case "append", "cap", "complex", "copy", "imag", "len", "make", "max", "min", "new", "real", "recover", "unsafe.Alignof", "unsafe.Offsetof", "unsafe.Sizeof":
 			return 1
 		}
 	}

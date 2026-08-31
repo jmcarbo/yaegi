@@ -4224,7 +4224,11 @@ func appendSlice(n *node) {
 }
 
 func _append(n *node) {
-	if len(n.child) == 3 {
+	// Slice expansion (appendSlice) is only valid for the ellipsis form
+	// `append(s, e...)`, flagged by aCallSlice. Without ellipsis a slice or
+	// array argument is appended as a single element, even when the element
+	// type of the destination matches the argument type.
+	if len(n.child) == 3 && n.action == aCallSlice {
 		c1, c2 := n.child[1], n.child[2]
 		if (c1.typ.cat == valueT || c2.typ.cat == valueT) && c1.typ.rtype == c2.typ.rtype ||
 			isArray(c2.typ) && c2.typ.elem().id() == n.typ.elem().id() ||
@@ -4496,6 +4500,67 @@ func _len(n *node) {
 		dest(f).SetInt(int64(value(f).Len()))
 		return next
 	}
+}
+
+func _max(n *node) { genMinMax(n, false) }
+
+func _min(n *node) { genMinMax(n, true) }
+
+// genMinMax compiles the min and max builtins (Go 1.21+). Arguments have been
+// type checked to a single ordered type by check.builtin; values are compared
+// through reflect so numeric kinds of any width and strings are covered.
+func genMinMax(n *node, isMin bool) {
+	dest := genValueOutput(n, n.typ.TypeOf())
+	values := make([]func(*frame) reflect.Value, 0, len(n.child)-1)
+	for _, c := range n.child[1:] {
+		values = append(values, genValue(c))
+	}
+	next := getExec(n.tnext)
+
+	if wantEmptyInterface(n) {
+		n.exec = func(f *frame) bltn {
+			best := values[0](f)
+			for _, value := range values[1:] {
+				if v := value(f); isMin == valueLess(v, best) {
+					best = v
+				}
+			}
+			dest(f).Set(reflect.ValueOf(best.Interface()))
+			return next
+		}
+		return
+	}
+	n.exec = func(f *frame) bltn {
+		best := values[0](f)
+		for _, value := range values[1:] {
+			if v := value(f); isMin == valueLess(v, best) {
+				best = v
+			}
+		}
+		dest(f).Set(best)
+		return next
+	}
+}
+
+// valueLess reports whether a < b for values of the same ordered type.
+func valueLess(a, b reflect.Value) bool {
+	if a.Kind() == reflect.Interface {
+		a = a.Elem()
+	}
+	if b.Kind() == reflect.Interface {
+		b = b.Elem()
+	}
+	switch a.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return a.Int() < b.Int()
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return a.Uint() < b.Uint()
+	case reflect.Float32, reflect.Float64:
+		return a.Float() < b.Float()
+	case reflect.String:
+		return a.String() < b.String()
+	}
+	return false
 }
 
 func _new(n *node) {

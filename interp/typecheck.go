@@ -734,6 +734,8 @@ var builtinFuncs = map[string]struct {
 	bltnDelete:   {args: 2, variadic: false},
 	bltnLen:      {args: 1, variadic: false},
 	bltnMake:     {args: 1, variadic: true},
+	bltnMax:      {args: 1, variadic: true},
+	bltnMin:      {args: 1, variadic: true},
 	bltnNew:      {args: 1, variadic: false},
 	bltnOffsetof: {args: 1, variadic: false},
 	bltnPanic:    {args: 1, variadic: false},
@@ -798,6 +800,49 @@ func (check typecheck) builtin(name string, n *node, child []*node, ellipsis boo
 			ident: "append",
 		}
 		return check.arguments(n, child, fun, ellipsis)
+	case bltnMax, bltnMin:
+		// All arguments must be assignable to a single ordered type (Go spec).
+		var typ *itype
+		for _, p := range params {
+			pt := p.Type()
+			if pt == nil || pt.untyped {
+				continue
+			}
+			if typ == nil {
+				typ = pt
+				continue
+			}
+			if !pt.assignableTo(typ) {
+				return p.nod.cfgErrorf("invalid argument: %s is not assignable to %s", pt.id(), typ.id())
+			}
+		}
+		if typ == nil {
+			// All arguments are untyped constants. Per spec the result is an
+			// untyped constant whose default type every argument would assume;
+			// approximate by promoting to untyped float if any argument is
+			// untyped float, else keep the first argument's untyped type.
+			typ = params[0].Type()
+			for _, p := range params {
+				if pt := p.Type(); pt != nil && pt.untyped && pt.cat == float64T {
+					typ = pt
+					break
+				}
+			}
+		}
+		switch typ.TypeOf().Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+			reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+			reflect.Float32, reflect.Float64, reflect.String:
+		default:
+			return n.cfgErrorf("invalid argument: %s is not ordered", typ.id())
+		}
+		for _, p := range params {
+			if pt := p.Type(); pt != nil && pt.untyped {
+				if err := check.convertUntyped(p.nod, typ); err != nil {
+					return err
+				}
+			}
+		}
 	case bltnCap, bltnLen:
 		typ := arrayDeref(params[0].Type())
 		ok := false

@@ -854,6 +854,11 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 						}
 						// Do not overload existing symbols (defined in GTA) in global scope.
 						sym, _, _ = sc.lookup(dest.ident)
+						if sym != nil && sym.kind == bltnSym {
+							// A definition always shadows a predeclared builtin:
+							// never reuse the universe symbol, define a new one.
+							sym = nil
+						}
 					}
 					if sym == nil {
 						sym = &symbol{index: sc.add(dest.typ), kind: varSym, typ: dest.typ}
@@ -1336,7 +1341,7 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 			case isBuiltinCall(n, sc):
 				bname := c0.ident
 				switch bname {
-				case bltnAppend, bltnComplex, bltnCopy, bltnDelete, bltnPrint, bltnPrintln:
+				case bltnAppend, bltnComplex, bltnCopy, bltnDelete, bltnMax, bltnMin, bltnPrint, bltnPrintln:
 					snapshotArgs = true
 				case bltnMake:
 					snapshotArgs = len(n.child) > 2
@@ -1627,7 +1632,10 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 			init, body := n.child[0], n.child[1]
 			n.start = init.start
 			init.tnext = body.start
-			body.tnext = n.start
+			// Loop back to the body start, not to the for statement start:
+			// the init statement must run exactly once or loop variables
+			// are re-initialized at each iteration.
+			body.tnext = body.start
 			sc = sc.pop()
 
 		case forStmt2: // for cond {}
