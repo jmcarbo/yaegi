@@ -74,20 +74,24 @@ func (interp *Interpreter) insertFuncMetaEntryLocked(ref funcvalRef, meta interp
 	}
 	// Sweeps and purges may have deleted the previous entry while its wrapper
 	// is still alive (e.g. a bound alias restored after a sweep); clearing the
-	// leftover finalizer is required before arming a new one. A stale queued
-	// finalizer that the clear could not cancel is harmless for a narrower
-	// reason than the generation counter: the runtime never reuses a funcval
-	// address until its finalizer has executed, so a stale run and a fresh
-	// registration at the same key cannot coexist. The counter remains as
-	// belt-and-braces against future lifetime changes.
+	// leftover finalizer is required before arming a new one. A finalizer can
+	// only be queued while no mutator holds the object, and the clear below
+	// requires holding ref.ptr, so at clear time any previous finalizer is at
+	// worst armed-not-queued and the clear fully cancels it. The generation
+	// counter stays as belt-and-braces against future lifetime changes.
 	runtime.SetFinalizer(ref.ptr, nil)
 	key := ref.key
 	runtime.SetFinalizer(ref.ptr, func(fv *funcval) {
 		// The closure captures only the interpreter, the key and the
 		// generation — never the wrapper or the typed funcval pointer — so
-		// arming the finalizer does not keep the wrapper alive. A static
-		// (non-heap) funcval never receives a finalizer and simply keeps a
-		// permanent entry, like the value-keyed registry did.
+		// arming the finalizer does not keep the wrapper alive.
+		//
+		// Invariant: ref.ptr must be the base of a heap funcval. Every
+		// registration path passes a reflect.MakeFunc product (heap
+		// makeFuncImpl), which SetFinalizer requires. A static funcval (a
+		// top-level func or a no-capture literal) lives in rodata, where
+		// SetFinalizer fatal-errors instead of no-op'ing — never route one
+		// through here.
 		interp.evictFuncMetaAtFinalizer(key, generation)
 	})
 }
