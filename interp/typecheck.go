@@ -59,6 +59,12 @@ func (check typecheck) assignment(n *node, typ *itype, context string) error {
 	if typ == nil {
 		return nil
 	}
+	if typ.incomplete || n.typ.incomplete {
+		// An incomplete type has no reflect type yet: checking the
+		// assignment now would force its resolution and panic. The gta
+		// revisit pass retries the declaration once the type is defined.
+		return nil
+	}
 
 	if !n.typ.assignableTo(typ) && typ.str != "*unsafe2.dummy" {
 		if context == "" {
@@ -657,6 +663,12 @@ func (check typecheck) typeAssertionExpr(n *node, typ *itype) error {
 
 // conversion type checks the conversion of n to typ.
 func (check typecheck) conversion(n *node, typ *itype) error {
+	if typ.incomplete || n.typ.incomplete {
+		// An incomplete type has no reflect type yet: checking the
+		// conversion now would force its resolution and panic. The gta
+		// revisit pass retries the declaration once the type is defined.
+		return nil
+	}
 	var c constant.Value
 	if n.rval.IsValid() {
 		if con, ok := n.rval.Interface().(constant.Value); ok {
