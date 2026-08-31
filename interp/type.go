@@ -2016,10 +2016,43 @@ func lookupFieldOrMethod(t *itype, name string) *itype {
 	default:
 		n, _ := t.lookupMethod(name)
 		if n == nil {
-			return nil
+			// The method may be promoted through an embedded interface
+			// field, whose methods are not method nodes of t.
+			return t.lookupEmbeddedInterfaceMethod(name, map[*itype]bool{})
 		}
 		return n.typ
 	}
+}
+
+// lookupEmbeddedInterfaceMethod returns the function type of a method
+// promoted through an embedded interface field of a struct type, or nil.
+func (t *itype) lookupEmbeddedInterfaceMethod(name string, seen map[*itype]bool) *itype {
+	if seen[t] {
+		return nil
+	}
+	seen[t] = true
+	if t.cat == ptrT {
+		return t.val.lookupEmbeddedInterfaceMethod(name, seen)
+	}
+	if isInterface(t) {
+		seq := t.lookupField(name)
+		if seq == nil {
+			return nil
+		}
+		return t.fieldSeq(seq)
+	}
+	for _, f := range t.field {
+		if !f.embed {
+			continue
+		}
+		if mt := f.typ.lookupEmbeddedInterfaceMethod(name, seen); mt != nil {
+			return mt
+		}
+	}
+	if t.cat == linkedT {
+		return t.val.lookupEmbeddedInterfaceMethod(name, seen)
+	}
+	return nil
 }
 
 func exportName(s string) string {

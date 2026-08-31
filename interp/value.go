@@ -156,7 +156,11 @@ func genValue(n *node) func(*frame) reflect.Value {
 func genDestValue(typ *itype, n *node) func(*frame) reflect.Value {
 	convertLiteralValue(n, typ.TypeOf())
 	switch {
-	case isInterfaceSrc(typ) && (!isEmptyInterface(typ) || len(n.typ.method) > 0):
+	case isInterfaceSrc(typ) && (!isEmptyInterface(typ) || len(n.typ.methods()) > 0):
+		// When assigning to an empty interface, wrap as soon as the source
+		// carries any method (directly or promoted through embedding): the
+		// valueInterface wrapper is what keeps the dynamic type available
+		// for further type assertions and interface calls.
 		return genValueInterface(n)
 	case isNamedFuncSrc(n.typ):
 		return genFunctionWrapper(n)
