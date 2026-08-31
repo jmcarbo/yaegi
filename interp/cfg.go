@@ -149,7 +149,7 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 						return true
 					case selectorExpr:
 						if target.action == aGetSym {
-							return target.sym != nil && target.sym.kind == varSym || target.rval.IsValid() && target.rval.CanSet()
+							return target.sym != nil && target.sym.kind == varSym || target.rval.IsValid() && target.rval.CanSet() || isBinPkgVar(target)
 						}
 						if _, ok := target.val.([]int); !ok || len(target.child) == 0 {
 							return false
@@ -924,6 +924,11 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 					// Do not skip assign operation if it is combined with another operator.
 				case src.rval.IsValid():
 					// Do not skip assign operation if setting from a constant value.
+				case isBinPkgVar(dest):
+					// A settable binary package variable is reached through
+					// its live host cell, not an interpreter frame slot: the
+					// assignment must stay an explicit Set, as the source has
+					// no destination location to write to.
 				case isMapEntry(dest):
 					// Setting a map entry requires an additional step, do not optimize.
 					// As we only write, skip the default useless getIndexMap dest action.
@@ -937,15 +942,14 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 						break
 					}
 					n.gen = nop
-					src.level = level
-					src.findex = dest.findex
+					src.findex, src.level = frameLocation(dest)
 					if src.typ.untyped && !dest.typ.untyped {
 						src.typ = dest.typ
 					}
 				case n.nleft == 1 && n.nright == 1 && src.action == aRecv:
 					// Assign by reading from a receiving channel.
 					n.gen = nop
-					src.findex = dest.findex // Set recv address to LHS.
+					src.findex, src.level = frameLocation(dest) // Set recv address to LHS location (global for package variables).
 					dest.typ = src.typ
 				case n.nleft == 1 && n.nright == 1 && src.action == aCompositeLit:
 					if dest.typ.cat == valueT && dest.typ.rtype.Kind() == reflect.Interface {
@@ -957,13 +961,11 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 						break
 					}
 					n.gen = nop
-					src.findex = dest.findex
-					src.level = level
+					src.findex, src.level = frameLocation(dest)
 				case len(n.child) < 4 && n.kind != defineStmt && isArithmeticAction(src) && !isInterface(dest.typ):
 					// Optimize single assignments from some arithmetic operations.
 					src.typ = dest.typ
-					src.findex = dest.findex
-					src.level = level
+					src.findex, src.level = frameLocation(dest)
 					n.gen = nop
 				case src.kind == basicLit:
 					// Assign to nil.
@@ -1113,9 +1115,15 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				// To avoid a copy in frame, if the result is to be assigned, store it directly
 				// at the frame location of destination.
 				dest := n.anc.child[childPos(n)-n.anc.nright]
+				if isBinPkgVar(dest) {
+					// A binary package variable has no interpreter frame
+					// location: allocate a regular temporary, and let the
+					// assignment Set the live destination cell.
+					n.findex = sc.add(n.typ)
+					break
+				}
 				n.typ = dest.typ
-				n.findex = dest.findex
-				n.level = dest.level
+				n.findex, n.level = frameLocation(dest)
 			case n.anc.kind == returnStmt:
 				// To avoid a copy in frame, if the result is to be returned, store it directly
 				// at the frame location reserved for output arguments.
@@ -2065,6 +2073,15 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				if s, ok := interp.binPkg[pkg][name]; ok {
 					if isBinType(s) {
 						n.typ = valueTOf(s.Type().Elem())
+					} else if s.CanSet() {
+						// A settable binary package symbol is mutable
+						// storage, not a constant: expose its live cell so
+						// reads always see the current value and writes
+						// reach the host variable, instead of capturing a
+						// stale snapshot at compile time (issue #1632).
+						n.typ = valueTOf(fixPossibleConstType(s.Type()), withUntyped(isValueUntyped(s)))
+						n.val = s
+						n.findex = notInFrame
 					} else {
 						n.typ = valueTOf(fixPossibleConstType(s.Type()), withUntyped(isValueUntyped(s)))
 						n.rval = s
@@ -3231,6 +3248,32 @@ func isFuncField(n *node) bool {
 
 func isMapEntry(n *node) bool {
 	return n.action == aGetIndex && isMap(n.child[0].typ)
+}
+
+// isBinPkgVar returns true if the node is a selector referring to a settable
+// (mutable) variable of a binary package. Such a variable is reached through
+// its live host cell exposed as the node value, not through an interpreter
+// frame slot.
+func isBinPkgVar(n *node) bool {
+	if n.kind != selectorExpr || len(n.child) < 2 || n.child[0].typ == nil || n.child[0].sym == nil {
+		return false
+	}
+	if n.child[0].typ.cat != binPkgT {
+		return false
+	}
+	s, ok := n.interp.binPkg[n.child[0].sym.typ.path][n.child[1].ident]
+	return ok && s.IsValid() && !isBinType(s) && s.CanSet()
+}
+
+// frameLocation returns the frame index and level where the value of an
+// assignment destination actually lives. For a global variable, the symbol
+// index is the authoritative storage location: the node findex may have been
+// reallocated as a temporary result slot during selector compilation.
+func frameLocation(n *node) (int, int) {
+	if n.sym != nil && n.sym.global && n.sym.index >= 0 {
+		return n.sym.index, globalFrame
+	}
+	return n.findex, n.level
 }
 
 func isCall(n *node) bool {
