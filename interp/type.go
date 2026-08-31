@@ -843,6 +843,26 @@ func nodeType2(interp *Interpreter, sc *scope, n *node, seen []*node) (t *itype,
 		switch lt.cat {
 		case arrayT, mapT, sliceT, variadicT:
 			t = lt.val
+		case valueT, stringT, linkedT, ptrT:
+			// Indexing a string (yielding byte), an array or slice behind a
+			// value or pointer type, or a defined type with an indexable
+			// underlying type.
+			rt := lt.TypeOf()
+			if rt == nil {
+				t = lt
+				break
+			}
+			for rt.Kind() == reflect.Ptr {
+				rt = rt.Elem()
+			}
+			switch rt.Kind() {
+			case reflect.String:
+				t = sc.getType("byte")
+			case reflect.Array, reflect.Slice, reflect.Map:
+				t = valueTOf(rt.Elem(), withScope(sc))
+			default:
+				err = n.cfgErrorf("invalid operation: %s is not indexable", lt.id())
+			}
 		case genericT:
 			t1, err := nodeType2(interp, sc, n.child[1], seen)
 			if err != nil {
@@ -2443,8 +2463,8 @@ func boundMethodType(rt reflect.Type) reflect.Type {
 	}
 	return reflect.FuncOf(ins, outs, rt.IsVariadic())
 }
-func isMap(t *itype) bool  { return t.TypeOf().Kind() == reflect.Map }
-func isPtr(t *itype) bool  { return t.TypeOf().Kind() == reflect.Ptr }
+func isMap(t *itype) bool { return t.TypeOf().Kind() == reflect.Map }
+func isPtr(t *itype) bool { return t.TypeOf().Kind() == reflect.Ptr }
 
 func isEmptyInterface(t *itype) bool {
 	return t != nil && t.cat == interfaceT && len(t.field) == 0

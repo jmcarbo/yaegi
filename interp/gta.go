@@ -2,6 +2,7 @@ package interp
 
 import (
 	"path"
+	"reflect"
 	"sort"
 )
 
@@ -68,6 +69,17 @@ func (interp *Interpreter) gta(root *node, rpath, importPath, pkgName string) ([
 				sbase = len(n.child) - n.nright
 			}
 
+			// Type and evaluate all sources before registering any
+			// destination symbol: in Go, the right-hand side of a
+			// declaration cannot refer to the variables it declares
+			// (toto, titi := 1, toto must be an undefined error).
+			type globalDefine struct {
+				ident     string
+				typ       *itype
+				val       reflect.Value
+				constKind bool
+			}
+			defines := make([]globalDefine, 0, n.nleft)
 			for i := 0; i < n.nleft; i++ {
 				dest, src := n.child[i], n.child[sbase+i]
 				if err2 = interp.compileGenericCalls(sc, src, importPath, pkgName); err2 != nil {
@@ -110,9 +122,13 @@ func (interp *Interpreter) gta(root *node, rpath, importPath, pkgName string) ([
 				if typ.isBinMethod {
 					typ = valueTOf(typ.methodCallType(), isBinMethod(), withScope(sc))
 				}
-				sc.sym[dest.ident] = &symbol{kind: varSym, global: true, index: sc.add(typ), typ: typ, rval: val, node: n}
-				if n.anc.kind == constDecl {
-					sc.sym[dest.ident].kind = constSym
+				d := globalDefine{ident: dest.ident, typ: typ, val: val, constKind: n.anc.kind == constDecl}
+				defines = append(defines, d)
+			}
+			for _, d := range defines {
+				sc.sym[d.ident] = &symbol{kind: varSym, global: true, index: sc.add(d.typ), typ: d.typ, rval: d.val, node: n}
+				if d.constKind {
+					sc.sym[d.ident].kind = constSym
 					if childPos(n) == len(n.anc.child)-1 {
 						sc.iota = 0
 					} else {

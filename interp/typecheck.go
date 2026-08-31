@@ -1,7 +1,6 @@
 package interp
 
 import (
-	"os"
 	"errors"
 	"go/constant"
 	"go/token"
@@ -280,9 +279,6 @@ func (check typecheck) binaryExpr(n *node) error {
 	// Ensure that if values are untyped, both are converted to the same type
 	_ = check.convertUntyped(c0, c1.typ)
 	_ = check.convertUntyped(c1, c0.typ)
-	if os.Getenv("YAEGI_DBG_BIN") != "" && (n.action == aAnd || n.action == aAdd) {
-		println("DBG bin", n.action.String(), n.interp.fset.Position(n.pos).String(), "c0:", c0.kind.String(), c0.typ.id(), "c1:", c1.kind.String(), c1.typ.id(), "n.typ:", func() string { if n.typ == nil { return "nil" }; return n.typ.id() }())
-	}
 
 	if isComparisonAction(a) {
 		return check.comparison(n)
@@ -734,26 +730,26 @@ var builtinFuncs = map[string]struct {
 	args     int
 	variadic bool
 }{
-	bltnAlignof:  {args: 1, variadic: false},
-	bltnAppend:   {args: 1, variadic: true},
-	bltnCap:      {args: 1, variadic: false},
-	bltnClose:    {args: 1, variadic: false},
-	bltnComplex:  {args: 2, variadic: false},
-	bltnImag:     {args: 1, variadic: false},
-	bltnCopy:     {args: 2, variadic: false},
-	bltnDelete:   {args: 2, variadic: false},
-	bltnLen:      {args: 1, variadic: false},
-	bltnMake:     {args: 1, variadic: true},
-	bltnMax:      {args: 1, variadic: true},
-	bltnMin:      {args: 1, variadic: true},
-	bltnNew:      {args: 1, variadic: false},
-	bltnOffsetof: {args: 1, variadic: false},
-	bltnPanic:    {args: 1, variadic: false},
-	bltnPrint:    {args: 0, variadic: true},
-	bltnPrintln:  {args: 0, variadic: true},
-	bltnReal:     {args: 1, variadic: false},
-	bltnRecover:  {args: 0, variadic: false},
-	bltnSizeof:   {args: 1, variadic: false},
+	bltnAlignof:     {args: 1, variadic: false},
+	bltnAppend:      {args: 1, variadic: true},
+	bltnCap:         {args: 1, variadic: false},
+	bltnClose:       {args: 1, variadic: false},
+	bltnComplex:     {args: 2, variadic: false},
+	bltnImag:        {args: 1, variadic: false},
+	bltnCopy:        {args: 2, variadic: false},
+	bltnDelete:      {args: 2, variadic: false},
+	bltnLen:         {args: 1, variadic: false},
+	bltnMake:        {args: 1, variadic: true},
+	bltnMax:         {args: 1, variadic: true},
+	bltnMin:         {args: 1, variadic: true},
+	bltnNew:         {args: 1, variadic: false},
+	bltnOffsetof:    {args: 1, variadic: false},
+	bltnPanic:       {args: 1, variadic: false},
+	bltnPrint:       {args: 0, variadic: true},
+	bltnPrintln:     {args: 0, variadic: true},
+	bltnReal:        {args: 1, variadic: false},
+	bltnRecover:     {args: 0, variadic: false},
+	bltnSizeof:      {args: 1, variadic: false},
 	"unsafe.Slice":  {args: 2, variadic: false},
 	"unsafe.String": {args: 2, variadic: false},
 }
