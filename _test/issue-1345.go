@@ -15,3 +15,6 @@ func main() {
 	ok := errors.As(wrapped, &target)
 	fmt.Println("found:", ok, target != nil)
 }
+
+// Output:
+// found: true true

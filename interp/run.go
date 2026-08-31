@@ -937,6 +937,12 @@ func typeAssert(n *node, withResult, withOk bool) {
 			ctyp := reflect.TypeOf(concrete)
 
 			if vv, ok := concrete.(valueInterface); ok {
+				// The carried value may itself be a bridge box or a raw
+				// concrete which visited binary land: recover the
+				// interpreted view before the type check.
+				if vv2, _, ok2 := f.interp.recoverInterpretedView(vv.value); ok2 && vv2.value.IsValid() {
+					vv = vv2
+				}
 				ctyp = vv.value.Type()
 				concrete = vv.value.Interface()
 			} else if _, isBox := unbridgeValue(reflect.ValueOf(concrete)); isBox {
@@ -987,9 +993,13 @@ func typeAssert(n *node, withResult, withOk bool) {
 				return next
 			}
 			v = valueInterfaceValue(v)
-			if vt := v.Type(); vt.Kind() == reflect.Struct && vt.Field(0).Name == "IValue" {
+			if vt := v.Type(); vt.Kind() == reflect.Struct && vt.NumField() > 0 && vt.Field(0).Name == "IValue" {
 				// Value is retrieved from an interface wrapper.
 				v = v.Field(0).Elem()
+			}
+			if vi, ok := unbridgeValue(v); ok && vi.value.IsValid() {
+				// A bridge box carries the concrete interpreted value.
+				v = vi.value
 			}
 			ok = canAssertTypes(v.Type(), rtype)
 			if !ok {
@@ -2458,16 +2468,19 @@ func callBin(n *node) {
 			// out-parameter bridge (see genValueOutErrorBridge).
 			isPtrToPtr := isPtrSrc(c.typ) && isPtrSrc(c.typ.val)
 			deferOrGo := n.anc.kind == deferStmt || n.anc.kind == goStmt
+			defTypeSubstituted := false
 			if getMapType != nil && !isPtrToPtr && (defType == emptyInterfaceType ||
 				(defType.Kind() == reflect.Slice && defType.Elem() == emptyInterfaceType)) {
 				if rt := getMapType(c.typ); rt != nil {
 					defType = rt
+					defTypeSubstituted = true
 				}
 			}
 			if getWrapType != nil && !isPtrToPtr && (defType == emptyInterfaceType ||
 				(defType.Kind() == reflect.Slice && defType.Elem() == emptyInterfaceType)) {
 				if rt := getWrapType(c.typ); rt != nil {
 					defType = rt
+					defTypeSubstituted = true
 				}
 			}
 
@@ -2511,7 +2524,7 @@ func callBin(n *node) {
 					values = append(values, genInterfaceWrapper(c, defType))
 				}
 			case isPtrSrc(c.typ):
-				if c.typ.val.cat == valueT {
+				if c.typ.val.cat == valueT || c.typ.val.cat == errorT {
 					values = append(values, genValue(c))
 				} else if unwrap && isPtrToPtr && isOutErrorBridge(getMapType, c) && !deferOrGo && len(c.child) > 0 {
 					idx := len(values)
@@ -2520,16 +2533,20 @@ func callBin(n *node) {
 						bridgeAfters = map[int]func(*frame, reflect.Value){}
 					}
 					bridgeAfters[idx] = writeBackOutErrorBridge(c)
-				} else if unwrap && defType.Kind() == reflect.Interface && defType.NumMethod() > 0 &&
-					defType != valueInterfaceType && !isPtrToPtr &&
-					c.typ.val.cat != valueT && c.typ.val.cat != errorT &&
+				} else if defTypeSubstituted && defType != valueInterfaceType && !isPtrToPtr && !deferOrGo && len(c.child) > 0 &&
 					c.typ.val.implements(&itype{cat: valueT, rtype: defType}) {
 					// The pointer's pointee satisfies the parameter interface:
 					// bind the wrapper through the pointer and pass a pointer
-					// to the box, so out-style native code (json.Unmarshal)
-					// finds an addressable implementer writing through to the
-					// interpreted value.
-					values = append(values, genPtrAliasInterfaceWrapper(c, defType))
+					// to the box, so out-style native code (errors.As,
+					// json.Unmarshal) finds an addressable implementer whose
+					// methods write through to the interpreted value.
+					idx := len(values)
+					arg, after := genPtrAliasInterfaceWrapper(c, defType)
+					values = append(values, arg)
+					if bridgeAfters == nil {
+						bridgeAfters = map[int]func(*frame, reflect.Value){}
+					}
+					bridgeAfters[idx] = after
 				} else if unwrap && getDeepType != nil && !deferOrGo && !deepInout && getDeepType(c.typ) != nil {
 					// Read-only marshal of a pointer to a container with
 					// bridged contents.
@@ -2826,8 +2843,9 @@ func getIndexBinValueMethod(n *node) {
 	i := n.findex
 	l := n.level
 	m := n.val.(int)
-	// The introspection method name, recovered from the static method
-	// signature of the selector (the receiver type is the first input).
+	// The introspection method name, recovered once at gen time from the
+	// static method signature of the selector (the receiver type is the
+	// first input).
 	name := n.typ.rtype.In(0).Method(m).Name
 	value := genValue(n.child[0])
 	next := getExec(n.tnext)
@@ -2872,7 +2890,8 @@ func bridgeReflectMethod(f *frame, receiver reflect.Value, sig reflect.Type, nam
 		return reflect.MakeFunc(stripFuncRecv(sig), func(in []reflect.Value) []reflect.Value {
 			i := int(in[0].Int())
 			if i < 0 || i >= len(names) {
-				return []reflect.Value{reflect.Zero(sig.Out(0))}
+				// Native reflect panics on out-of-range indexes.
+				panic("reflect: Method index out of range")
 			}
 			return []reflect.Value{boxValue(bindBridgedMethod(f, inner, names[i]))}
 		}), true
@@ -4577,6 +4596,45 @@ func rangeMap(n *node) {
 	}
 }
 
+// caseValueInterface recovers the interpreted view of a type-switch source:
+// a valueInterface wrapper, a bridge box, or a raw concrete value traced back
+// to its interpreted type through the reverse registry. The node keeps the
+// pointer shape of the concrete value, so case types like *T match by id.
+func (interp *Interpreter) caseValueInterface(ival any) (valueInterface, bool) {
+	if v, ok := ival.(valueInterface); ok {
+		return v, true
+	}
+	rv := reflect.ValueOf(ival)
+	if !rv.IsValid() {
+		return valueInterface{}, false
+	}
+	vi, ok := unbridgeValue(rv)
+	if !ok {
+		if rv.Kind() != reflect.Struct && rv.Kind() != reflect.Ptr {
+			return valueInterface{}, false
+		}
+		ti := interp.rtypeItype(rv.Type())
+		if ti == nil || isEmptyInterface(ti) || !mayHaveMethods(ti) {
+			return valueInterface{}, false
+		}
+		vi = valueInterface{value: rv}
+	}
+	if vi.node == nil && vi.value.IsValid() {
+		ti := interp.rtypeItype(vi.value.Type())
+		if ti == nil || isEmptyInterface(ti) {
+			return valueInterface{}, false
+		}
+		if vi.value.Kind() == reflect.Ptr {
+			ti = &itype{cat: ptrT, val: ti, str: "*" + ti.str}
+		}
+		vi.node = nodeOfType(ti)
+	}
+	if vi.node == nil {
+		return valueInterface{}, false
+	}
+	return vi, true
+}
+
 func _case(n *node) {
 	tnext := getExec(n.tnext)
 
@@ -4598,7 +4656,7 @@ func _case(n *node) {
 			} else {
 				n.exec = func(f *frame) bltn {
 					ival := srcValue(f).Interface()
-					val, ok := ival.(valueInterface)
+					val, ok := f.interp.caseValueInterface(ival)
 					// TODO(mpl): I'm assuming here that !ok means that we're dealing with the empty
 					// interface case. But maybe we should make sure by checking the relevant cat
 					// instead? later. Use t := v.Type(); t.Kind() == reflect.Interface , like above.
@@ -4679,9 +4737,16 @@ func _case(n *node) {
 						destValue(f).Set(elem)
 						return tnext
 					}
+					// A value which visited binary land may still be traced
+					// back to its interpreted type (bridge box or raw
+					// concrete): recover the view before failing the match.
+					if vi, ok := f.interp.caseValueInterface(v.Interface()); ok && vi.node != nil && vi.node.typ.id() == typ.id() {
+						destValue(f).Set(vi.value)
+						return tnext
+					}
 					return fnext
 				}
-				if vi, ok := v.Interface().(valueInterface); ok {
+				if vi, ok := f.interp.caseValueInterface(v.Interface()); ok {
 					if vi.node != nil {
 						if vi.node.typ.id() == typ.id() {
 							destValue(f).Set(vi.value)
@@ -4724,13 +4789,28 @@ func _case(n *node) {
 							return tnext
 						}
 					}
+					if vi, ok := f.interp.caseValueInterface(val.Interface()); ok && vi.node != nil {
+						for _, typ2 := range types {
+							if vi.node.typ.id() == typ2.id() {
+								destValue(f).Set(vi.value)
+								return tnext
+							}
+						}
+					}
 					return fnext
 				}
-				if vi, ok := val.Interface().(valueInterface); ok {
+				if vi, ok := f.interp.caseValueInterface(val.Interface()); ok {
 					if v := vi.node; v != nil {
 						for _, typ := range types {
 							if v.typ.id() == typ.id() {
-								destValue(f).Set(val)
+								// In a multi-type case the assigned variable
+								// keeps the interface type: set the
+								// interpreted view, not the raw concrete.
+								if destValue(f).Type() == valueInterfaceType {
+									destValue(f).Set(reflect.ValueOf(vi))
+								} else {
+									destValue(f).Set(vi.value)
+								}
 								return tnext
 							}
 						}

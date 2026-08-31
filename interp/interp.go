@@ -741,11 +741,16 @@ func (w _error) As(target any) bool {
 
 // Is implements interface{ Is(error) bool }, consulted by errors.Is: _error
 // carries a func field and is not comparable, so identity falls back to the
-// carried concrete values.
+// carried concrete values. Pointer-shaped boxes (the alias crossing) are
+// unwrapped first.
 func (w _error) Is(target error) bool {
 	t, ok := target.(_error)
 	if !ok {
-		return false
+		pt, ok := target.(*_error)
+		if !ok || pt == nil {
+			return false
+		}
+		t = *pt
 	}
 	return bridgeValuesIdentical(w.IValue, t.IValue)
 }

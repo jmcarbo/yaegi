@@ -43,3 +43,8 @@ func main() {
 	err3 := json.Unmarshal(b2, &col2)
 	fmt.Println(col2.Collection[0].Name, col2.Collection[1].Surname, err3 == nil)
 }
+
+// Output:
+// {"FullName":"Name Surname"} true
+// {"Collection":[{"FullName":"A B"},{"FullName":"C D"}]} true
+// A D true

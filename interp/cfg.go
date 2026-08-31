@@ -64,7 +64,7 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 	// their crash semantics.
 	defer func() {
 		if r := recover(); r != nil {
-			if e, ok := r.(error); ok && strings.Contains(e.Error(), invalidRecursiveTypeMsg) {
+			if e, ok := r.(*invalidRecursiveTypeError); ok {
 				initNodes, err = nil, e
 			} else {
 				panic(r)
@@ -792,7 +792,7 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				// the panic. Already-typed rejections (invalid recursive
 				// type) carry their own message and are recovered into an
 				// error at the cfg entry.
-				if e, ok := r.(error); ok && strings.Contains(e.Error(), invalidRecursiveTypeMsg) {
+				if _, ok := r.(*invalidRecursiveTypeError); ok {
 					panic(r)
 				}
 				panic(n.cfgErrorf("CFG post-order panic: %v", r))

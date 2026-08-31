@@ -13,3 +13,6 @@ func main() {
 	var fb f
 	reflect.ValueOf(&fb).MethodByName("One").Call([]reflect.Value{})
 }
+
+// Output:
+// 1

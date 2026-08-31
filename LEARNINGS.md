@@ -408,3 +408,52 @@
     mark exactly what the host receives; boxes keep func-bearing values
     visible to the funcmeta collectors through their interface fields, so
     PurgeRetainedFuncs and the sweeps behave as before.
+
+- Host-bridge review round (2026-08-31), load-bearing fixes found by an
+  adversarial pass over the initial implementation:
+  - `errors.As` with an error-INTERFACE target (`var e error; As(w, &e)`)
+    regressed to a nil-interface panic once errors.As carried a mapTypes
+    entry: the substituted wrapper path walked the pointer to the error cell
+    and called MethodByName on nil. Interface (and binary valueT) pointees
+    must pass raw — they are already native; only concrete pointees go
+    through the out bridge or the alias.
+  - A value-receiver error target (`var t V; As(w, &t)`) needs the ALIAS
+    path (pointer to box) plus a write-back: errors.As REPLACES the box
+    content, so callBin copies the box's carried value into the interpreted
+    variable cell after the call (a no-op when unmatched, and for aliased
+    pointers whose methods write through directly).
+  - `json.Unmarshal` into a nil map: the mirror write-back must allocate
+    the map (`MakeMap`) and use a SETTABLE per-key scratch (`New().Elem()`,
+    not `reflect.Zero` — route methods write through it); nil pointer
+    elements are allocated like native json does; the routed receiver binds
+    to the element cell itself (its address for pointer receivers), never
+    to a detached scratch copy.
+  - TextUnmarshaler leaves receive the BARE decoded string (re-marshalling
+    a JSON string keeps the quotes); xml.Unmarshal is excluded from the
+    inout bridge (UnmarshalXML's decoder signature cannot be routed by
+    re-marshalling — it keeps structural behavior).
+  - Type switches recover the interpreted view too: a source which visited
+    binary land (box, raw concrete, or valueInterface-wrapped box) is
+    re-derived through the reverse registry, and in a MULTI-type case the
+    assigned variable keeps the interface type, so the valueInterface view
+    (not the raw concrete) is assigned into valueInterface-typed cells.
+  - `RegisterBridge` vs boxing raced: the host-bridge match takes its
+    snapshot under the bridge lock; the match caches key by interpreted
+    type id, so concurrent registrations may interleave between Evals but
+    never tear a match.
+  - The bridge catalog is rebuilt on every Use (packages registered after
+    the first evaluation contribute box types), and box selection prefers
+    well-known interface packages (fmt/errors, encoding, sort, io, ...) over
+    obscure same-shape ones (expvar.Var would otherwise win the
+    String()-shaped tie and hand hosts a false `.(expvar.Var)` match).
+  - The `encoding/json` `Encoder.Encode` entries (mapTypes and bridge
+    policy) were INERT and were removed: method-value callees have no
+    rval at compile time, and both mapTypes and the policy are keyed by the
+    callee funcval. `json.NewEncoder(w).Encode(v)` keeps structural
+    marshalling; use `json.Marshal` for dispatch. Keying by
+    (receiver type, method name) at cfg is the future fix.
+  - Invalid recursive types are rejected via a dedicated error type
+    recovered at the cfg entry (message-substring matching was brittle).
+  - Corpus files need explicit `// Output:` comments to be asserted by
+    TestFile; without them they only run (silently) under the consistency
+    build.

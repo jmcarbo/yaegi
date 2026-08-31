@@ -69,19 +69,15 @@ func init() {
 	}
 	deepBridgePolicy[reflect.ValueOf(json.Marshal)] = deepBridgeSpec{marshalers, false, false}
 	deepBridgePolicy[reflect.ValueOf(json.MarshalIndent)] = deepBridgeSpec{marshalers, false, false}
-	deepBridgePolicy[reflect.ValueOf(new(json.Encoder).Encode)] = deepBridgeSpec{marshalers, false, false}
 	deepBridgePolicy[reflect.ValueOf(xml.Marshal)] = deepBridgeSpec{marshalers, false, false}
 	deepBridgePolicy[reflect.ValueOf(xml.MarshalIndent)] = deepBridgeSpec{marshalers, false, false}
-	deepBridgePolicy[reflect.ValueOf(new(xml.Encoder).Encode)] = deepBridgeSpec{marshalers, false, false}
 	deepBridgePolicy[reflect.ValueOf(json.Unmarshal)] = deepBridgeSpec{unmarshalers, true, false}
-	deepBridgePolicy[reflect.ValueOf(xml.Unmarshal)] = deepBridgeSpec{unmarshalers, true, false}
 	// %w requires a genuine error: direct concrete values implementing
 	// Error() string are boxed for this function only, so the other fmt
 	// verbs keep formatting the raw value (a %d on a named int type, for
 	// example, would otherwise see an opaque box).
 	deepBridgePolicy[reflect.ValueOf(fmt.Errorf)] = deepBridgeSpec{
 		[]reflect.Type{reflect.TypeOf((*error)(nil)).Elem()}, false, true}
-	_ = deepBridgePolicy
 }
 
 // bridgeEntry describes one native box type able to carry an interpreted
@@ -180,12 +176,18 @@ func (interp *Interpreter) rebuildBridgeCatalog() {
 		add(t.Elem())
 	}
 	// Most specific first: composed wrappers (more methods) before simple
-	// ones, mirroring the mapTypes construction order. Ties are broken by
-	// box type name, so the box chosen for a given method set is
-	// deterministic across runs (binPkg iteration order is random).
+	// ones, mirroring the mapTypes construction order. Ties are broken by a
+	// preference for well-known interface packages, then by box type name:
+	// the box chosen for a given method set is deterministic across runs
+	// (binPkg iteration order is random), and a single-method type is
+	// presented as fmt.Stringer rather than an obscure same-shape interface.
 	sort.SliceStable(entries, func(i, j int) bool {
 		if len(entries[i].names) != len(entries[j].names) {
 			return len(entries[i].names) > len(entries[j].names)
+		}
+		pi, pj := boxPathRank(entries[i].box), boxPathRank(entries[j].box)
+		if pi != pj {
+			return pi < pj
 		}
 		return entries[i].box.String() < entries[j].box.String()
 	})
@@ -196,6 +198,49 @@ func (interp *Interpreter) rebuildBridgeCatalog() {
 	b.catalog.byBox = byBox
 	b.match = map[string]*bridgeEntry{}
 	b.hostMatch = map[string]*hostBridge{}
+}
+
+// boxPathRank orders interface packages by how canonical they are for
+// host-facing boxing: well-known std interfaces first (lower rank).
+func boxPathRank(t reflect.Type) int {
+	path := t.PkgPath()
+	if path == "" {
+		// interp's own boxes (_error).
+		return 0
+	}
+	if r, ok := boxPathRankTable[path]; ok {
+		return r
+	}
+	return 100
+}
+
+var boxPathRankTable = map[string]int{
+	"":                0,
+	"fmt":             1,
+	"errors":          1,
+	"encoding":        2,
+	"encoding/json":   2,
+	"encoding/xml":    2,
+	"sort":            3,
+	"strconv":         3,
+	"io":              3,
+	"bufio":           4,
+	"container/heap":  4,
+	"container/list":  4,
+	"container/ring":  4,
+	"net/http":        4,
+	"database/sql":    4,
+	"compress/flate":  5,
+	"compress/gzip":   5,
+	"compress/zlib":   5,
+	"compress/bzip2":  5,
+	"compress/lzw":    5,
+	"crypto":          5,
+	"crypto/cipher":   5,
+	"crypto/elliptic": 5,
+	"crypto/ecdh":     5,
+	"hash":            5,
+	"expvar":          90,
 }
 
 // bridgeEntryOf validates that t is an interface wrapper box type and returns
@@ -357,6 +402,12 @@ func nodeOfType(typ *itype) *node {
 // returns the interpreted view it carries: a valueInterface when the node is
 // known, the concrete value otherwise. ok is false when v is not a box.
 func unbridgeValue(v reflect.Value) (valueInterface, bool) {
+	for v.IsValid() && v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			return valueInterface{}, false
+		}
+		v = v.Elem()
+	}
 	if !v.IsValid() || v.Kind() != reflect.Struct {
 		return valueInterface{}, false
 	}
@@ -380,41 +431,6 @@ func unbridgeValue(v reflect.Value) (valueInterface, bool) {
 		}
 	}
 	return valueInterface{value: iv.Elem()}, true
-}
-
-// concreteBridgeValue returns the concrete value carried by v, transparently
-// unboxing bridge boxes (and valueInterface wrappers) on the way.
-func concreteBridgeValue(v reflect.Value) reflect.Value {
-	for v.IsValid() {
-		if v.Kind() == reflect.Interface {
-			if v.IsNil() {
-				return v
-			}
-			v = v.Elem()
-			continue
-		}
-		if vi, ok := v.Interface().(valueInterface); ok {
-			v = vi.value
-			continue
-		}
-		if !isInterfaceWrapperType(v.Type()) {
-			return v
-		}
-		iv := v.Field(0)
-		if !iv.IsValid() {
-			return v
-		}
-		if c, ok := iv.Interface().(valueInterface); ok {
-			v = c.value
-			continue
-		}
-		nv := iv.Elem()
-		if !nv.IsValid() {
-			return v
-		}
-		v = nv
-	}
-	return v
 }
 
 // RegisterBridge teaches the interpreter to present interpreted values as
@@ -478,11 +494,15 @@ func (interp *Interpreter) hostBridgeFor(typ *itype) *hostBridge {
 
 func (interp *Interpreter) matchHostBridge(typ *itype) *hostBridge {
 	b := interp.bridgeState()
-	if len(b.hostBridges) == 0 || !mayHaveMethods(typ) {
+	// Snapshot under the lock: registrations may append concurrently.
+	b.mu.RLock()
+	bridges := b.hostBridges
+	b.mu.RUnlock()
+	if len(bridges) == 0 || !mayHaveMethods(typ) {
 		return nil
 	}
 	ms := typ.methods()
-	for _, cand := range b.hostBridges {
+	for _, cand := range bridges {
 		if len(ms) < len(cand.names) {
 			continue
 		}
@@ -668,8 +688,9 @@ func (interp *Interpreter) bridgeEvalResultRaw(res reflect.Value, f *frame) refl
 }
 
 var (
-	errorReflectType = reflect.TypeOf((*error)(nil)).Elem()
-	errorCellType    = reflect.TypeOf(_errorCell{})
+	errorReflectType    = reflect.TypeOf((*error)(nil)).Elem()
+	errorCellType       = reflect.TypeOf(_errorCell{})
+	textUnmarshalerType = reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
 )
 
 // isOutErrorBridge decides whether a pointer-to-pointer argument crossing a
@@ -1319,14 +1340,20 @@ func deepMirrorWriteBack(f *frame, mirror, orig reflect.Value, typ *itype, lr []
 			}
 			deepMirrorWriteBack(f, mirror.Index(i), ev, typ.val, lr, depth+1)
 		}
+		f.interp.markOwnedCellWriteFromExec(orig, out)
 		orig.Set(out)
 	case mapT:
 		if mirror.Kind() != reflect.Map {
 			return
 		}
+		if orig.IsNil() {
+			// json decoding into a nil map allocates it, as native does.
+			orig.Set(reflect.MakeMap(orig.Type()))
+		}
 		iter := mirror.MapRange()
 		for iter.Next() {
-			ev := reflect.Zero(orig.Type().Elem())
+			// A settable scratch: the routed leaf writes into it.
+			ev := reflect.New(orig.Type().Elem()).Elem()
 			if cur := orig.MapIndex(iter.Key()); cur.IsValid() {
 				ev.Set(cur)
 			}
@@ -1358,6 +1385,7 @@ func deepMirrorWriteBack(f *frame, mirror, orig reflect.Value, typ *itype, lr []
 		}
 	default:
 		if mirror.Type() == orig.Type() {
+			f.interp.markOwnedCellWriteFromExec(orig, mirror)
 			orig.Set(mirror)
 		}
 	}
@@ -1379,24 +1407,45 @@ func deepBridgeRouteMethod(f *frame, mirror, orig reflect.Value, typ *itype, lr 
 	if rt == nil || !mirror.IsValid() {
 		return
 	}
-	// Re-marshal the generic decoded value and let the interpreted method
-	// decode it into the original cell.
-	data, err := jsonMarshalValue(mirror)
-	if err != nil {
-		return
+	// The decoded generic leaf is routed through the interpreted method in
+	// the representation the interface expects: JSON bytes for
+	// json.Unmarshaler, the bare string for TextUnmarshaler (re-marshalling
+	// would keep the JSON quotes).
+	var data []byte
+	switch rt {
+	case textUnmarshalerType:
+		if mirror.Kind() == reflect.String {
+			data = []byte(mirror.String())
+		} else {
+			var err error
+			if data, err = jsonMarshalValue(mirror); err != nil {
+				return
+			}
+		}
+	default:
+		var err error
+		if data, err = jsonMarshalValue(mirror); err != nil {
+			return
+		}
 	}
 	methodName := interfaceMethodName(rt)
 	if methodName == "" {
 		return
 	}
-	scratch := reflect.New(orig.Type()).Elem()
 	m, index := typ.lookupMethod(methodName)
 	if m == nil {
 		return
 	}
-	recv := reflect.Value(scratch)
-	if isPtrRecvMethod(m) {
-		recv = scratch.Addr()
+	// The interpreted method writes through the original cell: allocate
+	// nil pointer elements (as native json does) and bind the receiver to
+	// the cell itself (its address for pointer-receiver methods), so
+	// mutations land in the interpreted container.
+	if orig.Kind() == reflect.Ptr && orig.IsNil() {
+		orig.Set(reflect.New(orig.Type().Elem()))
+	}
+	recv := orig
+	if isPtrRecvMethod(m) && orig.Kind() != reflect.Ptr {
+		recv = orig.Addr()
 	}
 	nod := *m
 	nod.val = &nod
@@ -1406,7 +1455,6 @@ func deepBridgeRouteMethod(f *frame, mirror, orig reflect.Value, typ *itype, lr 
 		return
 	}
 	w.Call([]reflect.Value{reflect.ValueOf(data)})
-	orig.Set(scratch)
 }
 
 // interfaceMethodName returns the single method of a single-method interface,
@@ -1439,14 +1487,52 @@ var jsonMarshalFunc atomic.Value
 // genPtrAliasInterfaceWrapper wraps an interpreted pointer whose pointee
 // satisfies the parameter interface, passing a pointer to the box so native
 // code (errors.As, json.Unmarshal) finds an addressable implementer whose
-// methods write through to the interpreted value.
-func genPtrAliasInterfaceWrapper(n *node, typ reflect.Type) func(*frame) reflect.Value {
+// methods write through to the interpreted value. The returned write-back
+// moves the box content (possibly replaced by the native code, e.g. the
+// error matched by errors.As) into the interpreted variable cell; for
+// aliased pointers it is a semantic no-op.
+func genPtrAliasInterfaceWrapper(n *node, typ reflect.Type) (func(*frame) reflect.Value, func(*frame, reflect.Value)) {
 	inner := genInterfaceWrapper(n, typ)
+	cell := genValue(n.child[0])
 	return func(f *frame) reflect.Value {
-		w := inner(f)
-		if w.IsValid() && w.Kind() == reflect.Struct && isInterfaceWrapperType(w.Type()) && w.CanAddr() {
-			return w.Addr()
+			w := inner(f)
+			if w.IsValid() && w.Kind() == reflect.Struct && isInterfaceWrapperType(w.Type()) && w.CanAddr() {
+				return w.Addr()
+			}
+			return w
+		}, func(f *frame, passed reflect.Value) {
+			box := passed
+			for box.IsValid() && box.Kind() == reflect.Ptr {
+				if box.IsNil() {
+					return
+				}
+				box = box.Elem()
+			}
+			if !box.IsValid() || box.Kind() != reflect.Struct || !isInterfaceWrapperType(box.Type()) {
+				return
+			}
+			iv := box.Field(0)
+			if !iv.IsValid() || !iv.CanInterface() {
+				return
+			}
+			cv := iv.Interface()
+			if cv == nil {
+				return
+			}
+			var value reflect.Value
+			if vi, ok := cv.(valueInterface); ok {
+				value = vi.value
+			} else {
+				value = reflect.ValueOf(cv)
+			}
+			if !value.IsValid() {
+				return
+			}
+			dest := cell(f)
+			if !dest.IsValid() || !dest.CanSet() || dest.Type() != value.Type() || dest == value {
+				return
+			}
+			f.interp.markOwnedCellWriteFromExec(dest, value)
+			dest.Set(value)
 		}
-		return w
-	}
 }

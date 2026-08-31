@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/traefik/yaegi/interp"
@@ -206,6 +207,17 @@ func makeAny() any { return Key{ID: "k1"} }
 }
 
 type CanEat interface{ Eat() }
+type CanFly interface{ Fly() string }
+
+type flyBridge struct{ mc interp.MethodCaller }
+
+func (b flyBridge) Fly() string {
+	r, err := b.mc.CallMethod("Fly", nil)
+	if err != nil {
+		return err.Error()
+	}
+	return r[0].String()
+}
 
 type canEatBridge struct{ mc interp.MethodCaller }
 
@@ -363,4 +375,258 @@ func main() {
 	if err == nil || !strings.Contains(err.Error(), "invalid recursive type") {
 		t.Fatalf("expected invalid recursive type error, got: %v", err)
 	}
+}
+
+// errors.As with an error-interface target keeps working (regression guard).
+func TestBridgeErrorsAsIfaceTarget(t *testing.T) {
+	i := interp.New(interp.Options{})
+	if err := i.Use(stdlib.Symbols); err != nil {
+		t.Fatal(err)
+	}
+	src := `
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+type T struct{ V int }
+
+func (t *T) Error() string { return "T" }
+
+func run() {
+	var e error
+	w := fmt.Errorf("outer: %w", &T{V: 1})
+	if !errors.As(w, &e) || e == nil {
+		panic("interface target not matched")
+	}
+	native := fmt.Errorf("native: %w", errors.New("plain"))
+	if !errors.As(native, &e) || e.Error() != "native: plain" {
+		panic("native chain not matched")
+	}
+}
+`
+	if _, err := i.Eval(src); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := i.Eval("main.run()"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// errors.As with a value-receiver error type as target.
+func TestBridgeErrorsAsValueTarget(t *testing.T) {
+	i := interp.New(interp.Options{})
+	if err := i.Use(stdlib.Symbols); err != nil {
+		t.Fatal(err)
+	}
+	src := `
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+type V struct{ N int }
+
+func (v V) Error() string { return "V" }
+
+func run() {
+	var t V
+	w := fmt.Errorf("outer: %w", V{N: 7})
+	if !errors.As(w, &t) || t.N != 7 {
+		panic("value target not matched")
+	}
+}
+`
+	if _, err := i.Eval(src); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := i.Eval("main.run()"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Type switches and assertions on values coming back from binary land
+// recover the interpreted view (#681).
+func TestBridgeTypeSwitchRoundTrip(t *testing.T) {
+	i := interp.New(interp.Options{})
+	if err := i.Use(stdlib.Symbols); err != nil {
+		t.Fatal(err)
+	}
+	src := `
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+type P struct{ N int }
+
+func (p *P) Error() string { return "P" }
+
+func run() {
+	w := fmt.Errorf("outer: %w", &P{N: 9})
+	u := errors.Unwrap(w)
+	switch x := u.(type) {
+	case *P:
+		if x.N != 9 {
+			panic("wrong value in type switch")
+		}
+	default:
+		panic("type switch did not match")
+	}
+	var i any = u
+	if p, ok := i.(*P); !ok || p.N != 9 {
+		panic("type assertion on any var did not match")
+	}
+}
+`
+	if _, err := i.Eval(src); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := i.Eval("main.run()"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// json.Unmarshal into a nil map with interpreted element unmarshalers
+// allocates the map, as native Go does.
+func TestBridgeJSONNilMap(t *testing.T) {
+	i := interp.New(interp.Options{})
+	if err := i.Use(stdlib.Symbols); err != nil {
+		t.Fatal(err)
+	}
+	src := `
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+)
+
+type P struct{ N int }
+
+func (p *P) UnmarshalJSON(b []byte) error {
+	var n int
+	if err := json.Unmarshal(b, &n); err != nil {
+		return err
+	}
+	p.N = n
+	return nil
+}
+
+func run() {
+	var m map[string]*P
+	if err := json.Unmarshal([]byte("{\"a\": 1}"), &m); err != nil {
+		panic(err)
+	}
+	if m == nil {
+		panic("nil map unmarshal failed: m nil")
+	}
+	if m["a"] == nil {
+		panic("nil map unmarshal failed: m[a] nil")
+	}
+	if m["a"].N != 1 {
+		panic("nil map unmarshal failed: N")
+	}
+	fmt.Println("ok")
+}
+`
+	if _, err := i.Eval(src); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := i.Eval("main.run()"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TextUnmarshaler leaves get the bare string, not the JSON-quoted form.
+func TestBridgeJSONTextUnmarshaler(t *testing.T) {
+	i := interp.New(interp.Options{})
+	if err := i.Use(stdlib.Symbols); err != nil {
+		t.Fatal(err)
+	}
+	src := `
+package main
+
+import (
+	"encoding"
+	"encoding/json"
+	"fmt"
+)
+
+type CT struct{ S string }
+
+func (c *CT) UnmarshalText(b []byte) error {
+	c.S = "TEXT<" + string(b) + ">"
+	return nil
+}
+
+var _ encoding.TextUnmarshaler = (*CT)(nil)
+
+func run() {
+	var xs []CT
+	if err := json.Unmarshal([]byte("[\"2026-08-31\"]"), &xs); err != nil {
+		panic(err)
+	}
+	if len(xs) != 1 || xs[0].S != "TEXT<2026-08-31>" {
+		panic(fmt.Sprintf("bad text unmarshal: %v", xs))
+	}
+	fmt.Println("ok")
+}
+`
+	if _, err := i.Eval(src); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := i.Eval("main.run()"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Concurrent RegisterBridge and boxing must not race (the host-bridge
+// snapshot is taken under the bridge lock).
+func TestBridgeRegisterBridgeRace(t *testing.T) {
+	i := interp.New(interp.Options{})
+	if err := i.Use(stdlib.Symbols); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := i.Eval(`package main
+
+type bird struct{}
+
+func (bird) Fly() string { return "flying" }
+
+func Make() any { return bird{} }
+`); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for k := 0; k < 8; k++ {
+		wg.Add(1)
+		go func(k int) {
+			defer wg.Done()
+			interp.RegisterBridge[CanFly](i, func(mc interp.MethodCaller) (CanFly, bool) {
+				return flyBridge{mc}, true
+			})
+			v, err := i.Eval("main.Make()")
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			fly, ok := v.Interface().(CanFly)
+			if !ok {
+				t.Errorf("k=%d: not CanFly: %T", k, v.Interface())
+				return
+			}
+			if got := fly.Fly(); got != "flying" {
+				t.Errorf("k=%d: %q", k, got)
+			}
+		}(k)
+	}
+	wg.Wait()
 }

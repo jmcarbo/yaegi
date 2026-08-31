@@ -1,7 +1,6 @@
 package interp
 
 import (
-	"errors"
 	"fmt"
 	"go/constant"
 	"path"
@@ -2093,11 +2092,13 @@ type refTypeContext struct {
 	slevel     int
 }
 
-// invalidRecursiveTypeMsg is the marker of an invalid recursive type
-// rejection (a value cycle through named struct fields). It is panic-ed from
-// the type algebra, where no error return is available, and recovered into a
+// invalidRecursiveTypeError marks an invalid recursive type rejection (a
+// value cycle through named struct fields). It is panic-ed from the type
+// algebra, where no error return is available, and recovered into a
 // compilation error at the cfg boundary.
-const invalidRecursiveTypeMsg = "invalid recursive type"
+type invalidRecursiveTypeError struct{ msg string }
+
+func (e *invalidRecursiveTypeError) Error() string { return e.msg }
 
 // Clone creates a copy of the ref type context.
 func (c *refTypeContext) Clone() *refTypeContext {
@@ -2259,7 +2260,7 @@ func (t *itype) refType(ctx *refTypeContext) reflect.Type {
 				// the compiler rejects it, and building it would create a
 				// cyclic runtime type graph which crashes reflect as soon as
 				// the type graph is walked (upstream issue #1534).
-				panic(errors.New(invalidRecursiveTypeMsg + " in " + name + ": field " + f.name + " " + f.typ.id()))
+				panic(&invalidRecursiveTypeError{msg: "invalid recursive type in " + name + ": field " + f.name + " " + f.typ.id()})
 			}
 			field := reflect.StructField{
 				Name: exportName(f.name),
