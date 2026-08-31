@@ -1325,17 +1325,38 @@ func (interp *Interpreter) ImportUsed() {
 	release := interp.acquireExecution()
 	defer release()
 	sc := interp.universe
+	// Count base names first: when several packages share the same base
+	// name, the plain name is ambiguous (and would depend on map iteration
+	// order), so it must not be bound at all. Explicit imports of these
+	// packages bind their own file-level symbol and resolve deterministically.
+	ambiguous := map[string]bool{}
+	count := map[string]int{}
+	for k := range interp.binPkg {
+		base := path.Base(k)
+		count[base]++
+		if count[base] > 1 {
+			ambiguous[base] = true
+		}
+	}
 	for k := range interp.binPkg {
 		// By construction, the package name is the last path element of the key.
 		name := path.Base(k)
+		if ambiguous[name] {
+			// Bind only the renamed, path-based symbol for ambiguous names.
+			sc.sym[key2name(fixKey(k))] = &symbol{kind: pkgSym, typ: &itype{cat: binPkgT, path: k, scope: sc}}
+			continue
+		}
 		if sym, ok := sc.sym[name]; ok {
-			// Handle collision by renaming old and new entries.
+			// Handle collision with a pre-existing symbol by renaming the old
+			// entry, then bind the plain name to the new package.
 			name2 := key2name(fixKey(sym.typ.path))
 			sc.sym[name2] = sym
 			if name2 != name {
 				delete(sc.sym, name)
 			}
 			name = key2name(fixKey(k))
+			sc.sym[name] = &symbol{kind: pkgSym, typ: &itype{cat: binPkgT, path: k, scope: sc}}
+			continue
 		}
 		sc.sym[name] = &symbol{kind: pkgSym, typ: &itype{cat: binPkgT, path: k, scope: sc}}
 	}
