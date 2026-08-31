@@ -251,3 +251,209 @@
   marshaler-bearing structs (#1486) is untouched. Note (verified by review):
   json.Marshal of a value held in a json.Marshaler variable DOES dispatch to
   MarshalJSON — the mapTypes match works there.
+
+- IMPLEMENTED 2026-08-31 (reflect-bridge): the reflect-limited issue family
+  (#847, #939/#681 host assertions, #1345, #1490/#1486 generic-struct JSON,
+  #1534, go-jose reflect.TypeOf pattern) was fixed by generalizing the
+  existing `_error`/`mapTypes` mechanism into a host-bridge layer, plus a
+  type-algebra guard. The precise mechanisms, per issue:
+  - Fundamental limit (documented, drives every choice): Go reflect cannot
+    synthesize named native types with methods at runtime (StructOf refuses
+    embedded fields with methods). Interpreted values therefore cross into
+    host code either as valueInterface wrappers (opaque), as raw anonymous
+    concrete values (right shape, no methods — the round-4 `any` unwrap
+    policy), or as generated interface wrapper boxes (struct with an IValue
+    first field plus one W<Method> func field per method, with real promoted
+    methods so the box genuinely implements the native interface —
+    `_error`, `_fmt_Stringer`, `_encoding_json_Marshaler`, ...). Boxes are
+    the substitute for method synthesis; everything below routes values into
+    them and back.
+  - #1345/errors.As (out-parameter bridge): the `%w` wrap silently failed
+    because an `&T{}` crossing fmt.Errorf's `...any` slot was raw concrete
+    and fmt's internal `.(error)` failed. Boxing error-implementers for the
+    whole fmt family is WRONG (a `%d` on a named int type with an Error
+    method would see an opaque box and print its fields instead of the
+    number), so the wrap boxing is a per-function policy: fmt.Errorf alone
+    (deepBridgePolicy wrap kind) boxes direct concrete values implementing
+    `Error() string` into `_error`, producing a real `*fmt.wrapError`, while
+    the print family keeps formatting raw values. errors.As's `target any`
+    takes a pointer whose pointee
+    implements error: a pointer-to-pointer argument is replaced by a pointer
+    to a fresh `_errorCell{_error; Want}` box (Want = the native type of the
+    interpreted target cell). errors.As accepts the box because `_error.As`
+    implements interface{ As(any) bool }: it matches only `*_errorCell`
+    targets whose Want equals the concrete type of the carried chain link,
+    preserving native per-type matching semantics (assignability never
+    matches — the target's Want alone decides). After the binary call
+    returns, callBin runs the write-back inside a fence-released stretch: it
+    reads the box through a native type assertion (reflect field access on
+    the unexported embedded field would poison the value), converts the
+    found error back to the concrete interpreted value and Sets the target
+    cell. Unmatched calls write the seeded original value back (a no-op).
+    `_error.Is` compares carried concrete values, because the box carries a
+    func field and is not comparable for errors.Is.
+  - #939 (Eval API boundary): an interpreted non-empty interface variable's
+    frame cell materializes as `interp.valueInterface` (refType interfaceT
+    case), which leaked to host code as the dynamic type. The Eval/
+    Execute/EvalPath funnel (executeWithPublication, before the ownership
+    sweeps, so they see what the host sees) re-boxes results: a
+    valueInterface-typed cell or an any-typed cell carrying an interpreted
+    concrete value is replaced by a native box when the value's method set
+    satisfies a registered host interface (RegisterBridge) or a catalog
+    interface (binPkg `_`-prefixed box types, indexed at Use time, most
+    methods first, ties broken by type name for determinism), else the raw
+    concrete value is returned (never valueInterface). The same conversion
+    runs on interpreted results crossing to host through function wrappers
+    (invokeInterpretedHostBoundary). Host-declared interfaces need
+    RegisterBridge[T](i, func(MethodCaller) (T, bool)): the host supplies a
+    small adapter struct implementing T by delegating to MethodCaller
+    (prebuilt per-method wrappers, bound while the frame is alive, so the
+    adapter keeps dispatching after the Eval ends). Without registration the
+    host sees the raw concrete value — documented, not fixable (no method
+    synthesis).
+  - #681 (assertions on values returning from reflect land): raw concrete
+    values crossing back are traced back to their interpreted type through a
+    reverse registry (rtype -> *itype, populated for named interpreted
+    structs in refType, keys for T and *T): typeAssert re-boxes them and
+    consults the interpreted method set; bridge boxes are unboxed through
+    their IValue (which bridge-built boxes fill with a valueInterface, and
+    legacy genInterfaceWrapper boxes with the concrete value); type switches
+    and getMethodByName use the same recovery. Raw method-less values keep
+    the round-4 behavior (structural reflection over plain data is
+    preserved); asserting such a value to an interpreted interface remains
+    impossible (no type info survives the crossing) — documented.
+  - #1486 (per-element JSON dispatch): json.Marshal's `any` slot unwraps
+    containers to raw concrete, so encoding/json's per-element Marshaler
+    check fails (right shape, no methods). A function-level policy table
+    (deepBridgePolicy in interp, keyed by the binary func value, carrying
+    the interface list and the direction) drives a container bridge:
+    read-only functions (json.Marshal/MarshalIndent/Encoder.Encode,
+    xml.Marshal family — the Encode entries were missing from mapTypes
+    entirely) get their containers rebuilt with bridged elements (slices of
+    marshaler elements rebuilt as []interface{} of boxes; struct fields
+    widened to interface{} in a cached rebuilt StructOf type, names/tags
+    preserved), so json dispatches interpreted MarshalJSON per element.
+    Pointer-receiver methods box through the addressable element, mirroring
+    json's addrMarshalerEncoder. Unmarshal-style functions get an inout
+    mirror: the target container is mirrored with Unmarshaler-satisfying
+    leaves widened to interface{} (other leaves stay native so json fills
+    them structurally), json decodes into the mirror, and the write-back
+    re-marshals each widened decoded leaf and feeds it through the
+    interpreted UnmarshalJSON writing the original element cell. Widening
+    (rather than pre-seeded boxes) is what makes json-allocated elements
+    work; a pre-seeded box slice would break on growth (zero boxes have no
+    bound method) and silently drop data. The write-back must run inside a
+    fence-released stretch (it re-enters interpreted code, which takes the
+    funcSweep fence per step). The policy is per function, never a global
+    catalog at unwrap sites: boxing a fmt.Stringer for a json.Marshal call
+    would replace structural reflection with an opaque box and break
+    marshalling (upstream_633's loud-failure contract).
+  - #1490 status correction: the generic Slice[T] viewStruct round trip
+    passed on the fork for the WRONG reason — the `ж` field is exported by
+    yaegi's canExport as `Xж` (uppercase X prefix), which encoding/json sees
+    as an exported field, so the round trip was structural and the custom
+    Marshal/UnmarshalJSON never fired; the test's method bodies happen to be
+    semantically equivalent to structural marshalling. With the bridge, the
+    same test passes through real dispatch (or stays structural when no
+    leaf satisfies the callee interfaces); the test is pinned as a canary.
+  - #847 (reflect.Value method introspection): reflect.ValueOf receives the
+    unwrapped concrete, so MethodByName/Method/NumMethod see no methods. The
+    reflect.Value introspection family is bridged at the binary-method
+    binding point (cfg swaps getIndexBinMethod for getIndexBinValueMethod
+    when the receiver type is reflect.Value and the method is in the
+    family): the returned value is a reflect.MakeFunc'd func value whose
+    closure resolves the interpreted method at call time through the
+    reverse rtype registry and binds it (genFunctionWrapper with the
+    receiver carried directly — a receiver node must be left nil, otherwise
+    genValueRecv resolves the receiver through a non-existent frame cell
+    and silently binds the wrong value). Native method-set rules are
+    mirrored (exported only; pointer-receiver methods only for pointers or
+    addressable values; unknown names fall back to native reflect and
+    return the zero Value). Type-level introspection (reflect.Type.Method)
+    is deliberately not bridged: interface method signatures carry no
+    receiver and faking reflect.Type results is unsound; document the
+    asymmetry. Host-side reflect on interpreted receivers remains
+    impossible (the dynamic type has no methods) — documented.
+  - #1534 (addTypeBits stack overflow): root cause is not pgx-specific.
+    refType accepted invalid recursive types (a value cycle through named
+    struct fields, e.g. `type A struct{ S string; a A }` — the compiler
+    rejects it, yaegi did not), built cyclic runtime type graphs via the
+    DummyType placeholder plus in-place unsafe2.SetFieldType patching, and
+    any later StructOf embedding the patched type (or the fork's owned-GC
+    walks) recursed infinitely in reflect.addTypeBits (its struct-field case
+    follows inline fields, and pointer/slice/map/func edges stop it — so
+    only inline value cycles loop). Guard: refType now rejects a bare
+    DummyType field type (a named struct under construction used as a value
+    field) with a proper compilation error ("invalid recursive type in
+    path/name: field f"), recovered at the cfg boundary into an ordinary
+    Eval error; legal pointer/slice/map/func recursion is untouched. Also
+    fixed on the way: the recursive-type rebuild loop patched dummy fields
+    from the single shared ctx.rect (the last detected under-construction
+    struct), silently corrupting field types when one struct has dummy
+    fields referencing different ancestors — each field is now patched from
+    its own declared itype.
+  - go-jose pattern: interface satisfaction through any crossings is fixed
+    by the bridge (Stringer/error/Marshaler boxes, or RegisterBridge for
+    host interfaces); type identity and names remain impossible —
+    StructOf types are anonymous (Name()==""), so host `x.(MyNativeType)`
+    and reflect.Type equality against named native types can never succeed.
+    Documented as the family's hard boundary; hosts must duck-type via
+    interfaces or shape.
+  - Box identity and determinism: the catalog sorts by method count then
+    box type name (binPkg iteration is random); bridge-built boxes fill
+    IValue with a valueInterface{node, value} (node = synthetic node carrying
+    the interpreted type) so unboxing recovers the method set; legacy boxes
+    keep the concrete value in IValue and unbox to concrete-only views.
+  - The Eval boundary conversion runs before the ownership sweeps so they
+    mark exactly what the host receives; boxes keep func-bearing values
+    visible to the funcmeta collectors through their interface fields, so
+    PurgeRetainedFuncs and the sweeps behave as before.
+
+- Host-bridge review round (2026-08-31), load-bearing fixes found by an
+  adversarial pass over the initial implementation:
+  - `errors.As` with an error-INTERFACE target (`var e error; As(w, &e)`)
+    regressed to a nil-interface panic once errors.As carried a mapTypes
+    entry: the substituted wrapper path walked the pointer to the error cell
+    and called MethodByName on nil. Interface (and binary valueT) pointees
+    must pass raw — they are already native; only concrete pointees go
+    through the out bridge or the alias.
+  - A value-receiver error target (`var t V; As(w, &t)`) needs the ALIAS
+    path (pointer to box) plus a write-back: errors.As REPLACES the box
+    content, so callBin copies the box's carried value into the interpreted
+    variable cell after the call (a no-op when unmatched, and for aliased
+    pointers whose methods write through directly).
+  - `json.Unmarshal` into a nil map: the mirror write-back must allocate
+    the map (`MakeMap`) and use a SETTABLE per-key scratch (`New().Elem()`,
+    not `reflect.Zero` — route methods write through it); nil pointer
+    elements are allocated like native json does; the routed receiver binds
+    to the element cell itself (its address for pointer receivers), never
+    to a detached scratch copy.
+  - TextUnmarshaler leaves receive the BARE decoded string (re-marshalling
+    a JSON string keeps the quotes); xml.Unmarshal is excluded from the
+    inout bridge (UnmarshalXML's decoder signature cannot be routed by
+    re-marshalling — it keeps structural behavior).
+  - Type switches recover the interpreted view too: a source which visited
+    binary land (box, raw concrete, or valueInterface-wrapped box) is
+    re-derived through the reverse registry, and in a MULTI-type case the
+    assigned variable keeps the interface type, so the valueInterface view
+    (not the raw concrete) is assigned into valueInterface-typed cells.
+  - `RegisterBridge` vs boxing raced: the host-bridge match takes its
+    snapshot under the bridge lock; the match caches key by interpreted
+    type id, so concurrent registrations may interleave between Evals but
+    never tear a match.
+  - The bridge catalog is rebuilt on every Use (packages registered after
+    the first evaluation contribute box types), and box selection prefers
+    well-known interface packages (fmt/errors, encoding, sort, io, ...) over
+    obscure same-shape ones (expvar.Var would otherwise win the
+    String()-shaped tie and hand hosts a false `.(expvar.Var)` match).
+  - The `encoding/json` `Encoder.Encode` entries (mapTypes and bridge
+    policy) were INERT and were removed: method-value callees have no
+    rval at compile time, and both mapTypes and the policy are keyed by the
+    callee funcval. `json.NewEncoder(w).Encode(v)` keeps structural
+    marshalling; use `json.Marshal` for dispatch. Keying by
+    (receiver type, method name) at cfg is the future fix.
+  - Invalid recursive types are rejected via a dedicated error type
+    recovered at the cfg entry (message-substring matching was brittle).
+  - Corpus files need explicit `// Output:` comments to be asserted by
+    TestFile; without them they only run (silently) under the consistency
+    build.

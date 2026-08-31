@@ -57,13 +57,24 @@ func init() {
 // and pre-compute frame sizes and indexes for all un-named (temporary) and named
 // variables. A list of nodes of init functions is returned.
 // Following this pass, the CFG is ready to run.
-func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string) ([]*node, error) {
+func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string) (initNodes []*node, err error) {
+	// Type computation can reject invalid programs by panicking from deep
+	// inside the type algebra (e.g. an invalid recursive type, see refType):
+	// surface those as ordinary compilation errors. Unrelated panics keep
+	// their crash semantics.
+	defer func() {
+		if r := recover(); r != nil {
+			if e, ok := r.(*invalidRecursiveTypeError); ok {
+				initNodes, err = nil, e
+			} else {
+				panic(r)
+			}
+		}
+	}()
 	if sc == nil {
 		sc = interp.initScopePkg(importPath, pkgName)
 	}
 	check := typecheck{scope: sc}
-	var initNodes []*node
-	var err error
 
 	baseName := path.Base(interp.fset.Position(root.pos).Filename)
 
@@ -777,7 +788,13 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 
 		defer func() {
 			if r := recover(); r != nil {
-				// Display the exact location in input source which triggered the panic
+				// Display the exact location in input source which triggered
+				// the panic. Already-typed rejections (invalid recursive
+				// type) carry their own message and are recovered into an
+				// error at the cfg entry.
+				if _, ok := r.(*invalidRecursiveTypeError); ok {
+					panic(r)
+				}
 				panic(n.cfgErrorf("CFG post-order panic: %v", r))
 			}
 		}()
@@ -3485,6 +3502,11 @@ func matchSelectorMethod(sc *scope, n *node) (err error) {
 			hasRecvType := n.typ.TypeOf().Kind() != reflect.Interface
 			n.val = method.Index
 			n.gen = getIndexBinMethod
+			if isReflectMethodBridgeTarget(n.typ.rtype, name) {
+				// reflect.Value method introspection family: special gen
+				// able to surface interpreted methods (issue #847).
+				n.gen = getIndexBinValueMethod
+			}
 			n.action = aGetMethod
 			n.recv = &receiver{node: n.child[0]}
 			n.typ = valueTOf(method.Type, isBinMethod())

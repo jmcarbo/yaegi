@@ -170,6 +170,22 @@ func (interp *Interpreter) Use(values Exports) error {
 		}
 	}
 
+	// Refresh the bridge catalog: packages used after the first evaluation
+	// contribute new box types.
+	if interp.bridges != nil {
+		interp.rebuildBridgeCatalog()
+	}
+
+	// Arm the json marshaler used by the inout deep bridge when the
+	// encoding/json symbols are available.
+	if p := interp.binPkg["encoding/json"]; p != nil {
+		if m, ok := p["Marshal"]; ok && m.IsValid() && m.Kind() == reflect.Func {
+			if f, ok := m.Interface().(func(any) ([]byte, error)); ok {
+				jsonMarshalFunc.Store(f)
+			}
+		}
+	}
+
 	// Checks if input values correspond to stdlib packages by looking for one
 	// well known stdlib package path.
 	if _, ok := values["fmt/fmt"]; ok {
