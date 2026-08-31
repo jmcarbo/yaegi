@@ -2,6 +2,7 @@ package interp
 
 import (
 	"path"
+	"reflect"
 	"sort"
 )
 
@@ -29,11 +30,20 @@ func (interp *Interpreter) gta(root *node, rpath, importPath, pkgName string) ([
 		case constDecl:
 			// Early parse of constDecl subtree, to compute all constant
 			// values which may be used in further declarations.
-			if _, err = interp.cfg(n, sc, importPath, pkgName); err != nil {
-				// No error processing here, to allow recovery in subtree nodes.
-				// TODO(marc): check for a non recoverable error and return it for better diagnostic.
-				err = nil
-			}
+			func() {
+				defer func() {
+					// A panic here means the constant value is not
+					// computable yet (for example a type declared later in
+					// the file): recover and let the defineStmt pass revisit
+					// the declaration once its dependencies are defined.
+					_ = recover()
+				}()
+				if _, err = interp.cfg(n, sc, importPath, pkgName); err != nil {
+					// No error processing here, to allow recovery in subtree nodes.
+					// TODO(marc): check for a non recoverable error and return it for better diagnostic.
+					err = nil
+				}
+			}()
 
 		case blockStmt:
 			if n != root {
@@ -68,6 +78,17 @@ func (interp *Interpreter) gta(root *node, rpath, importPath, pkgName string) ([
 				sbase = len(n.child) - n.nright
 			}
 
+			// Type and evaluate all sources before registering any
+			// destination symbol: in Go, the right-hand side of a
+			// declaration cannot refer to the variables it declares
+			// (toto, titi := 1, toto must be an undefined error).
+			type globalDefine struct {
+				ident     string
+				typ       *itype
+				val       reflect.Value
+				constKind bool
+			}
+			defines := make([]globalDefine, 0, n.nleft)
 			for i := 0; i < n.nleft; i++ {
 				dest, src := n.child[i], n.child[sbase+i]
 				if err2 = interp.compileGenericCalls(sc, src, importPath, pkgName); err2 != nil {
@@ -80,7 +101,18 @@ func (interp *Interpreter) gta(root *node, rpath, importPath, pkgName string) ([
 				}
 				val := src.rval
 				if n.anc.kind == constDecl {
-					if _, err2 := interp.cfg(n, sc, importPath, pkgName); err2 != nil {
+					if err2 := func() (err error) {
+						defer func() {
+							// A panic means the constant value is not
+							// computable yet (incomplete type or dependency):
+							// convert it to the revisit path below.
+							if r := recover(); r != nil {
+								err = n.cfgErrorf("constant not computable yet")
+							}
+						}()
+						_, err = interp.cfg(n, sc, importPath, pkgName)
+						return err
+					}(); err2 != nil {
 						// Constant value can not be computed yet.
 						// Come back when child dependencies are known.
 						revisit = append(revisit, n)
@@ -110,9 +142,13 @@ func (interp *Interpreter) gta(root *node, rpath, importPath, pkgName string) ([
 				if typ.isBinMethod {
 					typ = valueTOf(typ.methodCallType(), isBinMethod(), withScope(sc))
 				}
-				sc.sym[dest.ident] = &symbol{kind: varSym, global: true, index: sc.add(typ), typ: typ, rval: val, node: n}
-				if n.anc.kind == constDecl {
-					sc.sym[dest.ident].kind = constSym
+				d := globalDefine{ident: dest.ident, typ: typ, val: val, constKind: n.anc.kind == constDecl}
+				defines = append(defines, d)
+			}
+			for _, d := range defines {
+				sc.sym[d.ident] = &symbol{kind: varSym, global: true, index: sc.add(d.typ), typ: d.typ, rval: d.val, node: n}
+				if d.constKind {
+					sc.sym[d.ident].kind = constSym
 					if childPos(n) == len(n.anc.child)-1 {
 						sc.iota = 0
 					} else {
@@ -476,6 +512,11 @@ func (interp *Interpreter) gtaRetry(nodes []*node, importPath, pkgName string) e
 		n := revisit[0]
 		switch n.kind {
 		case typeSpec, typeSpecAssign:
+			if n.typ == nil {
+				// The type never resolved: report it instead of dereferencing
+				// a nil type below.
+				return n.cfgErrorf("undefined type: %s", n.child[0].ident)
+			}
 			if err := definedType(n.typ); err != nil {
 				return err
 			}

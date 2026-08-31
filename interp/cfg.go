@@ -106,6 +106,12 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 					n.typ = dest.typ
 				}
 			case binaryExpr, unaryExpr, parenExpr:
+				if isShiftCountOf(n) {
+					// The count operand of a shift does not take the type of
+					// the shift result: it stays any integer type (per spec,
+					// the propagation above must not leak into the count).
+					break
+				}
 				n.typ = n.anc.typ
 			}
 
@@ -143,7 +149,7 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 						return true
 					case selectorExpr:
 						if target.action == aGetSym {
-							return target.sym != nil && target.sym.kind == varSym || target.rval.IsValid() && target.rval.CanSet()
+							return target.sym != nil && target.sym.kind == varSym || target.rval.IsValid() && target.rval.CanSet() || isBinPkgVar(target)
 						}
 						if _, ok := target.val.([]int); !ok || len(target.child) == 0 {
 							return false
@@ -365,17 +371,26 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 			}
 
 			// Pre-define symbols for labels defined in this block, so we are sure that
-			// they are already defined when met.
+			// they are already defined when met. Labels nested in switch case
+			// bodies are function-scoped in Go, so they must be pre-defined
+			// here as well: case bodies do not bound label visibility.
 			// TODO(marc): labels must be stored outside of symbols to avoid collisions.
-			for _, c := range n.child {
-				if c.kind != labeledStmt {
-					continue
+			var predefineLabels func(sn *node)
+			predefineLabels = func(sn *node) {
+				for _, c := range sn.child {
+					switch c.kind {
+					case labeledStmt:
+						label := c.child[0].ident
+						sym := &symbol{kind: labelSym, node: c, index: -1}
+						sc.sym[label] = sym
+						c.sym = sym
+						predefineLabels(c)
+					case caseBody, caseClause, commClause:
+						predefineLabels(c)
+					}
 				}
-				label := c.child[0].ident
-				sym := &symbol{kind: labelSym, node: c, index: -1}
-				sc.sym[label] = sym
-				c.sym = sym
 			}
+			predefineLabels(n)
 			// If block is the body of a function, get declared variables in current scope.
 			// This is done in order to add the func signature symbols into sc.sym,
 			// as we will need them in post-processing.
@@ -834,6 +849,17 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 						}
 						if src.typ.isBinMethod {
 							dest.typ = valueTOf(src.typ.methodCallType())
+						} else if src.typ.cat == valueT && src.typ.recv != nil && !isInterface(src.typ.recv) && isFunc(src.typ) {
+							// A method value on a binary type: the rtype still
+							// carries the receiver as first argument (reflect
+							// Type.Method form), but the value produced at run
+							// time is bound. Type the destination with the
+							// bound signature.
+							if bt := boundMethodType(src.typ.TypeOf()); bt != nil {
+								dest.typ = valueTOf(bt, withScope(sc))
+							} else {
+								dest.typ = sc.fixType(src.typ)
+							}
 						} else {
 							// In a new definition, propagate the source type to the destination
 							// type. If the source is an untyped constant, make sure that the
@@ -864,6 +890,11 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 						}
 						// Do not overload existing symbols (defined in GTA) in global scope.
 						sym, _, _ = sc.lookup(dest.ident)
+						if sym != nil && sym.kind == bltnSym {
+							// A definition always shadows a predeclared builtin:
+							// never reuse the universe symbol, define a new one.
+							sym = nil
+						}
 					}
 					if sym == nil {
 						sym = &symbol{index: sc.add(dest.typ), kind: varSym, typ: dest.typ}
@@ -903,6 +934,11 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 					// Do not skip assign operation if it is combined with another operator.
 				case src.rval.IsValid():
 					// Do not skip assign operation if setting from a constant value.
+				case isBinPkgVar(dest):
+					// A settable binary package variable is reached through
+					// its live host cell, not an interpreter frame slot: the
+					// assignment must stay an explicit Set, as the source has
+					// no destination location to write to.
 				case isMapEntry(dest):
 					// Setting a map entry requires an additional step, do not optimize.
 					// As we only write, skip the default useless getIndexMap dest action.
@@ -916,15 +952,14 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 						break
 					}
 					n.gen = nop
-					src.level = level
-					src.findex = dest.findex
+					src.findex, src.level = frameLocation(dest)
 					if src.typ.untyped && !dest.typ.untyped {
 						src.typ = dest.typ
 					}
 				case n.nleft == 1 && n.nright == 1 && src.action == aRecv:
 					// Assign by reading from a receiving channel.
 					n.gen = nop
-					src.findex = dest.findex // Set recv address to LHS.
+					src.findex, src.level = frameLocation(dest) // Set recv address to LHS location (global for package variables).
 					dest.typ = src.typ
 				case n.nleft == 1 && n.nright == 1 && src.action == aCompositeLit:
 					if dest.typ.cat == valueT && dest.typ.rtype.Kind() == reflect.Interface {
@@ -936,13 +971,11 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 						break
 					}
 					n.gen = nop
-					src.findex = dest.findex
-					src.level = level
+					src.findex, src.level = frameLocation(dest)
 				case len(n.child) < 4 && n.kind != defineStmt && isArithmeticAction(src) && !isInterface(dest.typ):
 					// Optimize single assignments from some arithmetic operations.
 					src.typ = dest.typ
-					src.findex = dest.findex
-					src.level = level
+					src.findex, src.level = frameLocation(dest)
 					n.gen = nop
 				case src.kind == basicLit:
 					// Assign to nil.
@@ -1092,9 +1125,15 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				// To avoid a copy in frame, if the result is to be assigned, store it directly
 				// at the frame location of destination.
 				dest := n.anc.child[childPos(n)-n.anc.nright]
+				if isBinPkgVar(dest) {
+					// A binary package variable has no interpreter frame
+					// location: allocate a regular temporary, and let the
+					// assignment Set the live destination cell.
+					n.findex = sc.add(n.typ)
+					break
+				}
 				n.typ = dest.typ
-				n.findex = dest.findex
-				n.level = dest.level
+				n.findex, n.level = frameLocation(dest)
 			case n.anc.kind == returnStmt:
 				// To avoid a copy in frame, if the result is to be returned, store it directly
 				// at the frame location reserved for output arguments.
@@ -1346,7 +1385,7 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 			case isBuiltinCall(n, sc):
 				bname := c0.ident
 				switch bname {
-				case bltnAppend, bltnComplex, bltnCopy, bltnDelete, bltnPrint, bltnPrintln:
+				case bltnAppend, bltnComplex, bltnCopy, bltnDelete, bltnMax, bltnMin, bltnPrint, bltnPrintln:
 					snapshotArgs = true
 				case bltnMake:
 					snapshotArgs = len(n.child) > 2
@@ -1358,6 +1397,12 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				}
 
 				n.gen = c0.sym.builtin
+				if bname == bltnUnsafeSlice || bname == bltnUnsafeString {
+					// The result type is a slice or string, not builtinT:
+					// set the generator here, the builtinT switch below is
+					// not reached.
+					n.gen = unsafeBuiltin
+				}
 				c0.typ = &itype{cat: builtinT, name: bname}
 				if n.typ, err = nodeType(interp, sc, n); err != nil {
 					return
@@ -1396,6 +1441,14 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 						lenConst(n)
 					default:
 						err = n.cfgErrorf("len argument is not an array, channel or string")
+					}
+					n.findex = notInFrame
+					n.gen = nop
+				case (bname == bltnMin || bname == bltnMax) && isInConstOrTypeDecl(n):
+					// min and max of constant arguments produce a constant
+					// result; a non constant argument is an error here.
+					if err = minMaxConst(n); err != nil {
+						break
 					}
 					n.findex = notInFrame
 					n.gen = nop
@@ -1643,7 +1696,10 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 			init, body := n.child[0], n.child[1]
 			n.start = init.start
 			init.tnext = body.start
-			body.tnext = n.start
+			// Loop back to the body start, not to the for statement start:
+			// the init statement must run exactly once or loop variables
+			// are re-initialized at each iteration.
+			body.tnext = body.start
 			sc = sc.pop()
 
 		case forStmt2: // for cond {}
@@ -2033,10 +2089,19 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				if s, ok := interp.binPkg[pkg][name]; ok {
 					if isBinType(s) {
 						n.typ = valueTOf(s.Type().Elem())
+					} else if s.CanSet() {
+						// A settable binary package symbol is mutable
+						// storage, not a constant: expose its live cell so
+						// reads always see the current value and writes
+						// reach the host variable, instead of capturing a
+						// stale snapshot at compile time (issue #1632).
+						n.typ = valueTOf(fixPossibleConstType(s.Type()), withUntyped(isValueUntyped(s)))
+						n.val = s
+						n.findex = notInFrame
 					} else {
 						n.typ = valueTOf(fixPossibleConstType(s.Type()), withUntyped(isValueUntyped(s)))
 						n.rval = s
-						if pkg == "unsafe" && (name == "AlignOf" || name == "Offsetof" || name == "Sizeof") {
+						if pkg == "unsafe" && (name == "Alignof" || name == "Offsetof" || name == "Sizeof" || name == "Slice" || name == "String") {
 							n.sym = &symbol{kind: bltnSym, node: n, rval: s}
 							n.ident = pkg + "." + name
 						}
@@ -2412,6 +2477,12 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 			case n.anc.kind == assignStmt && n.anc.action == aAssign && n.anc.nright == 1:
 				dest := n.anc.child[childPos(n)-n.anc.nright]
 				n.typ = dest.typ
+				if isBinPkgVar(dest) {
+					// A binary package variable has no frame location: allocate a
+					// temporary, the assignment will Set the live destination cell.
+					n.findex = sc.add(n.typ)
+					break
+				}
 				n.findex = dest.findex
 				n.level = dest.level
 			case n.anc.kind == returnStmt:
@@ -3217,6 +3288,32 @@ func isMapEntry(n *node) bool {
 	return n.action == aGetIndex && isMap(n.child[0].typ)
 }
 
+// isBinPkgVar returns true if the node is a selector referring to a settable
+// (mutable) variable of a binary package. Such a variable is reached through
+// its live host cell exposed as the node value, not through an interpreter
+// frame slot.
+func isBinPkgVar(n *node) bool {
+	if n.kind != selectorExpr || len(n.child) < 2 || n.child[0].typ == nil || n.child[0].sym == nil {
+		return false
+	}
+	if n.child[0].typ.cat != binPkgT {
+		return false
+	}
+	s, ok := n.interp.binPkg[n.child[0].sym.typ.path][n.child[1].ident]
+	return ok && s.IsValid() && !isBinType(s) && s.CanSet()
+}
+
+// frameLocation returns the frame index and level where the value of an
+// assignment destination actually lives. For a global variable, the symbol
+// index is the authoritative storage location: the node findex may have been
+// reallocated as a temporary result slot during selector compilation.
+func frameLocation(n *node) (int, int) {
+	if n.sym != nil && n.sym.global && n.sym.index >= 0 {
+		return n.sym.index, globalFrame
+	}
+	return n.findex, n.level
+}
+
 func isCall(n *node) bool {
 	return n.action == aCall || n.action == aCallSlice
 }
@@ -3453,13 +3550,31 @@ func matchSelectorMethod(sc *scope, n *node) (err error) {
 	if m, lind := n.typ.lookupMethod(name); m != nil {
 		n.action = aGetMethod
 		if n.child[0].isType(sc) {
+			// A pointer-receiver method can only be referenced through a
+			// pointer type base (native Go: invalid method expression). The
+			// check applies to the declared method itself only: a promoted
+			// method follows the embedding chain rules.
+			if len(lind) == 0 && isPtrRecvMethod(m) && n.child[0].typ != nil && n.child[0].typ.cat != ptrT {
+				return n.cfgErrorf("invalid method expression %s.%s (needs pointer receiver (*%s).%s)",
+					n.child[0].typ.id(), name, n.child[0].typ.id(), name)
+			}
 			// Handle method as a function with receiver in 1st argument.
+			// The method expression is a func value: the receiver is not
+			// bound, it is provided at call time as first argument (#1499).
 			n.val = m
-			n.findex = notInFrame
-			n.gen = nop
+			n.gen = getMethodExpr
+			// The nil receiver node marks an unbound receiver. The embedded
+			// field indexes are kept, so the wrapper can project an outer
+			// receiver onto the embedded receiver of a promoted method.
+			n.recv = &receiver{index: lind}
 			n.typ = &itype{}
 			*n.typ = *m.typ
 			n.typ.arg = append([]*itype{n.child[0].typ}, m.typ.arg...)
+			// The original method type may already have a cached reflect type
+			// and id string, computed without the prepended receiver: reset
+			// them, so they are recomputed for the method expression type.
+			n.typ.rtype = nil
+			n.typ.str = funcOf(n.typ.arg, n.typ.ret).str
 		} else {
 			// Handle method with receiver.
 			n.gen = getMethod
@@ -3601,4 +3716,23 @@ func sizeof(n *node) {
 	n.gen = nop
 	n.typ = n.scope.getType("uintptr")
 	n.rval = reflect.ValueOf(n.child[1].typ.TypeOf().Size())
+}
+
+// isShiftCountOf reports whether n is the count operand of a shift
+// operation, looking through parentheses.
+func isShiftCountOf(n *node) bool {
+	for a := n.anc; a != nil && a.kind == parenExpr; {
+		n = a
+		a = a.anc
+	}
+	return n.anc != nil && isShiftNode(n.anc) && len(n.anc.child) > 1 && n.anc.child[1] == n
+}
+
+// isPtrRecvMethod reports whether the method declaration node m declares a
+// pointer receiver (func (t *T) M(...)).
+func isPtrRecvMethod(m *node) bool {
+	if len(m.child) == 0 || m.child[0].kind != fieldList || len(m.child[0].child) == 0 {
+		return false
+	}
+	return m.child[0].child[0].lastChild().kind == starExpr
 }

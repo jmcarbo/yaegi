@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"unsafe"
 )
 
 // bltn type defines functions which run at CFG execution.
@@ -308,10 +309,22 @@ func isExecNode(n *node, exec bltn) bool {
 	return a1 == a2
 }
 
+// execIdentity returns the funcval address of a builtin closure: the single
+// pointer word of a func variable. Unlike reflect.Value.Pointer(), which
+// returns the shared code pointer for closures created by the same generator,
+// the funcval address is unique per closure instance and identifies the exact
+// node exec.
+func execIdentity(exec bltn) uintptr {
+	if exec == nil {
+		return 0
+	}
+	return *(*uintptr)(unsafe.Pointer(&exec))
+}
+
 // originalExecNode looks in the tree of nodes for the node which has exec,
 // aside from n, in order to know where n "inherited" that exec from.
 func originalExecNode(n *node, exec bltn) *node {
-	execAddr := reflect.ValueOf(exec).Pointer()
+	execAddr := execIdentity(exec)
 	var originalNode *node
 	seen := make(map[int64]struct{})
 	root := n
@@ -335,7 +348,7 @@ func originalExecNode(n *node, exec bltn) *node {
 			if wn.exec == nil {
 				return true
 			}
-			if reflect.ValueOf(wn.exec).Pointer() == execAddr {
+			if execIdentity(wn.exec) == execAddr {
 				originalNode = wn
 				return false
 			}
@@ -567,7 +580,9 @@ func runCfg(n *node, f *frame, funcNode, callNode *node) {
 
 	dbg := n.interp.debugger
 	if dbg == nil {
-		for exec := n.exec; exec != nil && !f.canceled(); {
+		// Assign to the outer exec, not a shadow: the deferred recovery above
+		// reads it to locate the failing node for the panic position.
+		for exec = n.exec; exec != nil && !f.canceled(); {
 			exec = execWithFuncSweepFence(exec, f)
 		}
 		return
@@ -1603,7 +1618,10 @@ func genFunctionWrapper(n *node) func(*frame) reflect.Value {
 	numRet := len(def.typ.ret)
 	var rcvr func(*frame) reflect.Value
 
-	if n.recv != nil {
+	// A receiver with no node and no value marks an unbound receiver (method
+	// expression): the receiver is provided at call time as first argument,
+	// there is nothing to read from the frame.
+	if n.recv != nil && (n.recv.node != nil || n.recv.val.IsValid()) {
 		rcvr = genValueRecv(n)
 	}
 	value := genValue(n)
@@ -1683,6 +1701,13 @@ func invokeInterpretedHostBoundary(interp *Interpreter, typ reflect.Type, invoke
 func buildDeclaredFunctionWrapper(n, def *node, base *frame, receiver reflect.Value, root *frame, cancel <-chan struct{}) interpretedFuncBuild {
 	numRet := len(def.typ.ret)
 	start := def.child[3].start
+	// An unbound method wrapper (from a method expression) receives the method
+	// receiver as its first call argument, before the method own arguments.
+	unbound := !receiver.IsValid() && def.typ.recv != nil
+	argTypes := def.typ.arg
+	if unbound {
+		argTypes = append([]*itype{def.typ.recv}, def.typ.arg...)
+	}
 	invoke := func(in []reflect.Value, root *frame, cancel <-chan struct{}) []reflect.Value {
 		// Allocate and init local frame. All values to be settable and addressable.
 		fr := newFrame(base, len(def.types), base.runid())
@@ -1727,7 +1752,16 @@ func buildDeclaredFunctionWrapper(n, def *node, base *frame, receiver reflect.Va
 				// In case of unused arg, there may be not even a frame entry allocated, just skip.
 				break
 			}
-			typ := def.typ.arg[i]
+			if unbound && i == 0 {
+				// The first argument is the method receiver: project it onto
+				// the embedded receiver of a promoted method if any, and
+				// accommodate a pointer or value base in the expression.
+				arg = unboundMethodReceiver(n, arg, d[i].Kind())
+			}
+			typ := argTypes[i]
+			// Note: for an unbound wrapper, argTypes was built with the
+			// receiver prepended, so argTypes[i] is the type of the same
+			// argument as d[i] (the receiver at position 0).
 			switch {
 			case isEmptyInterface(typ) || typ.TypeOf() == valueInterfaceType:
 				d[i].Set(arg)
@@ -1755,6 +1789,40 @@ func buildDeclaredFunctionWrapper(n, def *node, base *frame, receiver reflect.Va
 		return buildDeclaredFunctionWrapper(n, def, clonedBase, clonedReceiver, c.newRoot, c.cancel)
 	}
 	return interpretedFuncBuild{value: wrapper, invoke: invoke, rebind: rebind}
+}
+
+// unboundMethodReceiver adapts the first call argument of an unbound method
+// (a method expression) to the method receiver expected by the method frame:
+// it projects an outer receiver onto the embedded field declaring a promoted
+// method, and accommodates a value or pointer base in the expression.
+func unboundMethodReceiver(n *node, src reflect.Value, destKind reflect.Kind) reflect.Value {
+	if n.recv != nil {
+		for _, i := range n.recv.index {
+			if src.Kind() == reflect.Ptr {
+				src = src.Elem()
+			}
+			src = src.Field(i)
+			if vi, ok := src.Interface().(valueInterface); ok {
+				src = vi.value
+			}
+		}
+	}
+	switch {
+	case src.Kind() == reflect.Ptr && destKind != reflect.Ptr:
+		// A value-receiver method selected through a pointer base: the
+		// receiver is a copy of the pointed value, as in native Go.
+		return src.Elem()
+	case src.Kind() != reflect.Ptr && destKind == reflect.Ptr:
+		// A pointer-receiver method with a value base can only occur on an
+		// addressable projection of the receiver argument.
+		if !src.CanAddr() {
+			c := reflect.New(src.Type()).Elem()
+			c.Set(src)
+			src = c
+		}
+		return src.Addr()
+	}
+	return src
 }
 
 func genInterfaceWrapper(n *node, typ reflect.Type) func(*frame) reflect.Value {
@@ -1805,7 +1873,11 @@ func genInterfaceWrapper(n *node, typ reflect.Type) func(*frame) reflect.Value {
 		if vi, ok := v.Interface().(valueInterface); ok {
 			n2 = vi.node
 		}
-		v = getConcreteValue(v)
+		// Keep the whole concrete value in the wrapper first field, so it can
+		// be retrieved intact by binary code reflecting over the wrapper (i.e.
+		// for marshalling) or by type assertions. Only valueInterface layers
+		// are unwrapped here.
+		v = valueInterfaceValue(v)
 		w := reflect.New(wrap).Elem()
 		w.Field(0).Set(v)
 		for i, m := range methods {
@@ -1849,16 +1921,44 @@ func methodByName(value reflect.Value, name string, index []int) (v reflect.Valu
 	if v = value.MethodByName(name); v.IsValid() {
 		return
 	}
+	if value.Kind() == reflect.Struct {
+		// The method may be promoted from an embedded struct field: get it
+		// from the field at the index path computed at compile time.
+		if checkFieldIndex(value.Type(), index) {
+			v = methodFromField(value.FieldByIndex(index), name)
+		}
+		return
+	}
 	for value.Kind() == reflect.Ptr {
 		value = value.Elem()
 		if checkFieldIndex(value.Type(), index) {
 			value = value.FieldByIndex(index)
+			// The promoted method may have a pointer receiver: get it from
+			// the address of the embedded field.
+			if v = methodFromField(value, name); v.IsValid() {
+				return
+			}
+			continue
 		}
 		if v = value.MethodByName(name); v.IsValid() {
 			return
 		}
 	}
 	return
+}
+
+// methodFromField returns the method name of a struct field, with either a
+// value receiver or, if the field is addressable, a pointer receiver.
+func methodFromField(field reflect.Value, name string) reflect.Value {
+	if v := field.MethodByName(name); v.IsValid() {
+		return v
+	}
+	if field.CanAddr() {
+		if v := field.Addr().MethodByName(name); v.IsValid() {
+			return v
+		}
+	}
+	return reflect.Value{}
 }
 
 func checkFieldIndex(typ reflect.Type, index []int) bool {
@@ -2285,14 +2385,33 @@ func callBin(n *node) {
 			} else {
 				defType = funcType.In(rcvrOffset + i)
 			}
-			if getMapType != nil {
+			// The interface wrapper substitution is only valid for empty
+			// interface arguments (including elements of a variadic empty
+			// interface parameter): a wrapper type of another interface
+			// would not match a non empty interface parameter at call time.
+			if getMapType != nil && (defType == emptyInterfaceType ||
+				(defType.Kind() == reflect.Slice && defType.Elem() == emptyInterfaceType)) {
 				if rt := getMapType(c.typ); rt != nil {
 					defType = rt
 				}
 			}
 
+			// When the target parameter is an empty interface (and not a
+			// variadic slice of empty interfaces), pass the concrete value to
+			// the binary function rather than an interpreter interface wrapper,
+			// so binary code does not reflect over wrapper structs (see for
+			// example json.Marshal). Wrappers are preserved for non-empty
+			// interface parameters, where method dispatch matters, and for
+			// variadic parameters, where values are still re-wrapped at run
+			// time if necessary (see getBinValue).
+			unwrap := defType.Kind() == reflect.Interface && defType.NumMethod() == 0
+
 			switch {
 			case isEmptyInterface(c.typ):
+				if unwrap {
+					values = append(values, genValueConcrete(getMapType, c))
+					break
+				}
 				values = append(values, genValue(c))
 			case isInterfaceSrc(c.typ):
 				values = append(values, genValueInterfaceValue(c))
@@ -2311,8 +2430,16 @@ func callBin(n *node) {
 					values = append(values, genInterfaceWrapper(c, defType))
 				}
 			case c.typ.cat == valueT:
+				if unwrap {
+					values = append(values, genValueConcrete(getMapType, c))
+					break
+				}
 				values = append(values, genValue(c))
 			default:
+				if unwrap {
+					values = append(values, genValueConcrete(getMapType, c))
+					break
+				}
 				values = append(values, genInterfaceWrapper(c, defType))
 			}
 		}
@@ -2883,6 +3010,27 @@ func getMethod(n *node) {
 	n.exec = func(f *frame) bltn {
 		nod := *n.val.(*node)
 		nod.val = &nod
+		nod.recv = n.recv
+		getFrame(f, l).data[i] = genFuncValue(&nod)(f)
+		return next
+	}
+}
+
+// getMethodExpr generates the func value of a method expression on an
+// interpreted type (for example (*T).M). The value is a func taking the
+// receiver as first argument, not a method bound to a receiver (#1499).
+func getMethodExpr(n *node) {
+	i := n.findex
+	l := n.level
+	next := getExec(n.tnext)
+
+	n.exec = func(f *frame) bltn {
+		nod := *n.val.(*node)
+		nod.val = &nod
+		// Give the method copy the method expression type, where the receiver
+		// is the first argument, and keep the unbound receiver marker, so the
+		// generated wrapper reads the receiver from the first call argument.
+		nod.typ = n.typ
 		nod.recv = n.recv
 		getFrame(f, l).data[i] = genFuncValue(&nod)(f)
 		return next
@@ -3709,11 +3857,17 @@ func doComposite(n *node, hasType bool, keyed bool) {
 		switch {
 		case d.Kind() == reflect.Ptr:
 			setOwnedValueOutput(f, d, a.Addr())
+		case destInterface && len(destType(n).field) > 0 && d.Type() == valueInterfaceType:
+			// The enclosing assignment was inlined into this composite
+			// literal: the destination cell is frame-typed as valueInterface,
+			// so store the interpreted interface representation directly.
+			setOwnedValueOutput(f, d, reflect.ValueOf(valueInterface{n, a}))
 		case destInterface:
-			if len(destType(n).field) > 0 {
-				setOwnedValueOutput(f, d, reflect.ValueOf(valueInterface{n, a}))
-				break
-			}
+			// The composite result goes to its own frame slot (the assignment
+			// was not inlined, i.e. the destination is a struct field, a
+			// dereferenced pointer or a binary interface). Keep the value
+			// concrete: the valueInterface wrapper is added later by the
+			// assignment itself (see genDestValue).
 			setOwnedValueOutput(f, d, a)
 		default:
 			if n.anc.kind == assignStmt && n.anc.action == aAssign {
@@ -3824,6 +3978,15 @@ func genRangeStore(n *node) func(*frame) func(reflect.Value) {
 				return func(value reflect.Value) { setOwnedValueOutput(f, destination, value) }
 			}
 		case selectorExpr:
+			if isBinPkgVar(n) {
+				// The destination is the live host cell exposed as the node
+				// value; the interpreter frame slot is not its storage.
+				return func(f *frame) func(reflect.Value) {
+					runRangeTargetPrelude(n, f)
+					destination := n.val.(reflect.Value)
+					return func(value reflect.Value) { setOwnedValueOutput(f, destination, value) }
+				}
+			}
 			receiver := genValue(n.child[0])
 			index, ok := n.val.([]int)
 			if ok {
@@ -4321,7 +4484,11 @@ func appendSlice(n *node) {
 }
 
 func _append(n *node) {
-	if len(n.child) == 3 {
+	// Slice expansion (appendSlice) is only valid for the ellipsis form
+	// `append(s, e...)`, flagged by aCallSlice. Without ellipsis a slice or
+	// array argument is appended as a single element, even when the element
+	// type of the destination matches the argument type.
+	if len(n.child) == 3 && n.action == aCallSlice {
 		c1, c2 := n.child[1], n.child[2]
 		if (c1.typ.cat == valueT || c2.typ.cat == valueT) && c1.typ.rtype == c2.typ.rtype ||
 			isArray(c2.typ) && c2.typ.elem().id() == n.typ.elem().id() ||
@@ -4591,6 +4758,142 @@ func _len(n *node) {
 	}
 	n.exec = func(f *frame) bltn {
 		dest(f).SetInt(int64(value(f).Len()))
+		return next
+	}
+}
+
+func _max(n *node) { genMinMax(n, false) }
+
+func _min(n *node) { genMinMax(n, true) }
+
+// genMinMax compiles the min and max builtins (Go 1.21+). Arguments have been
+// type checked to a single ordered type by check.builtin; values are compared
+// through reflect so numeric kinds of any width and strings are covered.
+func genMinMax(n *node, isMin bool) {
+	dest := genValueOutput(n, n.typ.TypeOf())
+	values := make([]func(*frame) reflect.Value, 0, len(n.child)-1)
+	for _, c := range n.child[1:] {
+		values = append(values, genValue(c))
+	}
+	next := getExec(n.tnext)
+
+	if wantEmptyInterface(n) {
+		n.exec = func(f *frame) bltn {
+			best := values[0](f)
+			for _, value := range values[1:] {
+				if v := value(f); isMin == valueLess(v, best) {
+					best = v
+				}
+			}
+			dest(f).Set(reflect.ValueOf(best.Interface()))
+			return next
+		}
+		return
+	}
+	n.exec = func(f *frame) bltn {
+		best := values[0](f)
+		for _, value := range values[1:] {
+			v := value(f)
+			if valueIsNaN(v) {
+				// Per spec, if any argument is NaN the result is NaN.
+				best = v
+				break
+			}
+			if !valueIsNaN(best) && isMin == valueLess(v, best) {
+				best = v
+			}
+		}
+		d := dest(f)
+		// The destination cell type may be narrower than the untyped
+		// arguments' default type: convert before storing.
+		if !best.Type().AssignableTo(d.Type()) {
+			best = best.Convert(d.Type())
+		}
+		d.Set(best)
+		return next
+	}
+}
+
+// valueLess reports whether a < b for values of the same ordered type.
+// It returns false when either floating point value is NaN, in which case
+// valueNaN reports whether the NaN must be propagated as the result.
+func valueLess(a, b reflect.Value) bool {
+	if a.Kind() == reflect.Interface {
+		a = a.Elem()
+	}
+	if b.Kind() == reflect.Interface {
+		b = b.Elem()
+	}
+	switch a.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return a.Int() < b.Int()
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return a.Uint() < b.Uint()
+	case reflect.Float32, reflect.Float64:
+		return a.Float() < b.Float()
+	case reflect.String:
+		return a.String() < b.String()
+	}
+	return false
+}
+
+// valueIsNaN reports whether v is a floating point NaN value.
+func valueIsNaN(v reflect.Value) bool {
+	if v.Kind() == reflect.Interface {
+		v = v.Elem()
+	}
+	switch v.Kind() {
+	case reflect.Float32, reflect.Float64:
+		return v.Float() != v.Float()
+	}
+	return false
+}
+
+// unsafeBuiltin compiles the unsafe.Slice and unsafe.String builtins. The
+// destination type is computed at compile time from the pointer argument
+// type; the runtime slices the memory range without copying it.
+func unsafeBuiltin(n *node) {
+	next := getExec(n.tnext)
+	dest := genValueOutput(n, n.typ.TypeOf())
+	value0 := genValue(n.child[1])
+	value1 := genValue(n.child[2])
+	isStringB := n.child[0].ident == bltnUnsafeString
+	destType := n.typ.TypeOf()
+
+	n.exec = func(f *frame) bltn {
+		p := value0(f)
+		lv := value1(f)
+		var l int
+		switch lv.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			l = int(lv.Int())
+		default:
+			l = int(lv.Uint())
+		}
+		if isStringB {
+			if l < 0 {
+				panic("unsafe.String: length out of range")
+			}
+			s := unsafe.String((*byte)(unsafe.Pointer(p.Pointer())), l)
+			dest(f).Set(reflect.ValueOf(s).Convert(destType))
+			return next
+		}
+		if p.IsNil() {
+			if l != 0 {
+				panic("unsafe.Slice: ptr is nil and len is not zero")
+			}
+			dest(f).Set(reflect.Zero(destType))
+			return next
+		}
+		if l < 0 {
+			panic("unsafe.Slice: len out of range")
+		}
+		s := reflect.New(destType).Elem()
+		h := (*reflect.SliceHeader)(unsafe.Pointer(s.UnsafeAddr())) //nolint:gosec,staticcheck
+		h.Data = p.Pointer()
+		h.Len = l
+		h.Cap = l
+		dest(f).Set(s)
 		return next
 	}
 }
@@ -5401,4 +5704,39 @@ func realConst(n *node) {
 		n.rval = reflect.ValueOf(real(v.Complex()))
 		n.gen = nop
 	}
+}
+
+// minMaxConst computes the constant value of a min or max call whose
+// arguments are all constants, in a constant declaration context.
+func minMaxConst(n *node) error {
+	isMin := n.child[0].ident == bltnMin
+	var best constant.Value
+	for _, c := range n.child[1:] {
+		if !c.rval.IsValid() {
+			return c.cfgErrorf("%s argument is not a constant", n.child[0].ident)
+		}
+		cv, ok := c.rval.Interface().(constant.Value)
+		if !ok {
+			if c.rval.Type().Kind() == reflect.Interface {
+				return c.cfgErrorf("%s argument is not a constant", n.child[0].ident)
+			}
+			cv = constant.Make(c.rval.Interface())
+		}
+		if best == nil {
+			best = cv
+			continue
+		}
+		op := token.GTR
+		if isMin {
+			op = token.LSS
+		}
+		if constant.Compare(cv, op, best) {
+			best = cv
+		}
+	}
+	if best == nil {
+		best = constant.MakeInt64(0)
+	}
+	n.rval = reflect.ValueOf(best)
+	return nil
 }

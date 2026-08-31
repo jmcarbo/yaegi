@@ -333,6 +333,11 @@ func (interp *Interpreter) executeWithPublication(p *Program, cancel <-chan stru
 	if !active() {
 		return reflect.Value{}, err
 	}
+	// A statement or void call has no result: return the zero Value rather
+	// than a stale value left in the root result slot by a previous eval.
+	if p.root.typ == nil {
+		res = reflect.Value{}
+	}
 
 	// If result is an interpreter node, wrap it in a runtime callable function.
 	if res.IsValid() {

@@ -836,6 +836,8 @@ const (
 	bltnDelete   = "delete"
 	bltnLen      = "len"
 	bltnMake     = "make"
+	bltnMax      = "max"
+	bltnMin      = "min"
 	bltnNew      = "new"
 	bltnOffsetof = "unsafe.Offsetof"
 	bltnPanic    = "panic"
@@ -844,6 +846,9 @@ const (
 	bltnReal     = "real"
 	bltnRecover  = "recover"
 	bltnSizeof   = "unsafe.Sizeof"
+
+	bltnUnsafeSlice  = "unsafe.Slice"
+	bltnUnsafeString = "unsafe.String"
 )
 
 func initUniverse() *scope {
@@ -891,6 +896,8 @@ func initUniverse() *scope {
 		bltnDelete:  {kind: bltnSym, builtin: _delete},
 		bltnLen:     {kind: bltnSym, builtin: _len},
 		bltnMake:    {kind: bltnSym, builtin: _make},
+		bltnMax:     {kind: bltnSym, builtin: _max},
+		bltnMin:     {kind: bltnSym, builtin: _min},
 		bltnNew:     {kind: bltnSym, builtin: _new},
 		bltnPanic:   {kind: bltnSym, builtin: _panic},
 		bltnPrint:   {kind: bltnSym, builtin: _print},
@@ -1344,17 +1351,38 @@ func (interp *Interpreter) ImportUsed() {
 	release := interp.acquireExecution()
 	defer release()
 	sc := interp.universe
+	// Count base names first: when several packages share the same base
+	// name, the plain name is ambiguous (and would depend on map iteration
+	// order), so it must not be bound at all. Explicit imports of these
+	// packages bind their own file-level symbol and resolve deterministically.
+	ambiguous := map[string]bool{}
+	count := map[string]int{}
+	for k := range interp.binPkg {
+		base := path.Base(k)
+		count[base]++
+		if count[base] > 1 {
+			ambiguous[base] = true
+		}
+	}
 	for k := range interp.binPkg {
 		// By construction, the package name is the last path element of the key.
 		name := path.Base(k)
-		if sym, ok := sc.sym[name]; ok {
-			// Handle collision by renaming old and new entries.
+		if ambiguous[name] {
+			// Bind only the renamed, path-based symbol for ambiguous names.
+			sc.sym[key2name(fixKey(k))] = &symbol{kind: pkgSym, typ: &itype{cat: binPkgT, path: k, scope: sc}}
+			continue
+		}
+		if sym, ok := sc.sym[name]; ok && sym.kind == pkgSym && sym.typ != nil {
+			// Handle collision with a pre-existing symbol by renaming the old
+			// entry, then bind the plain name to the new package.
 			name2 := key2name(fixKey(sym.typ.path))
 			sc.sym[name2] = sym
 			if name2 != name {
 				delete(sc.sym, name)
 			}
 			name = key2name(fixKey(k))
+			sc.sym[name] = &symbol{kind: pkgSym, typ: &itype{cat: binPkgT, path: k, scope: sc}}
+			continue
 		}
 		sc.sym[name] = &symbol{kind: pkgSym, typ: &itype{cat: binPkgT, path: k, scope: sc}}
 	}
