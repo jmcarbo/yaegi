@@ -316,7 +316,7 @@ func main() {
 	f(&c)
 }
 `,
-			errContains: "cannot use type *main.Client as type main.Client",
+			errContains: "invalid method expression main.Client.set (needs pointer receiver (*main.Client).set)",
 		},
 		{
 			desc: "method expression signature mismatch",
