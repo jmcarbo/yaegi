@@ -4548,7 +4548,13 @@ func genMinMax(n *node, isMin bool) {
 	n.exec = func(f *frame) bltn {
 		best := values[0](f)
 		for _, value := range values[1:] {
-			if v := value(f); isMin == valueLess(v, best) {
+			v := value(f)
+			if valueIsNaN(v) {
+				// Per spec, if any argument is NaN the result is NaN.
+				best = v
+				break
+			}
+			if !valueIsNaN(best) && isMin == valueLess(v, best) {
 				best = v
 			}
 		}
@@ -4564,6 +4570,8 @@ func genMinMax(n *node, isMin bool) {
 }
 
 // valueLess reports whether a < b for values of the same ordered type.
+// It returns false when either floating point value is NaN, in which case
+// valueNaN reports whether the NaN must be propagated as the result.
 func valueLess(a, b reflect.Value) bool {
 	if a.Kind() == reflect.Interface {
 		a = a.Elem()
@@ -4584,6 +4592,18 @@ func valueLess(a, b reflect.Value) bool {
 	return false
 }
 
+// valueIsNaN reports whether v is a floating point NaN value.
+func valueIsNaN(v reflect.Value) bool {
+	if v.Kind() == reflect.Interface {
+		v = v.Elem()
+	}
+	switch v.Kind() {
+	case reflect.Float32, reflect.Float64:
+		return v.Float() != v.Float()
+	}
+	return false
+}
+
 // unsafeBuiltin compiles the unsafe.Slice and unsafe.String builtins. The
 // destination type is computed at compile time from the pointer argument
 // type; the runtime slices the memory range without copying it.
@@ -4597,21 +4617,19 @@ func unsafeBuiltin(n *node) {
 
 	n.exec = func(f *frame) bltn {
 		p := value0(f)
-		l := int(value1(f).Int())
+		lv := value1(f)
+		var l int
+		switch lv.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			l = int(lv.Int())
+		default:
+			l = int(lv.Uint())
+		}
 		if isStringB {
 			if l < 0 {
 				panic("unsafe.String: length out of range")
 			}
-			var s string
-			if p.Kind() == reflect.Slice {
-				if l > p.Len() {
-					panic("unsafe.String: length out of range")
-				}
-				data := (*reflect.SliceHeader)(unsafe.Pointer(p.UnsafeAddr())) //nolint:gosec
-				s = unsafe.String((*byte)(unsafe.Pointer(data.Data)), l)
-			} else {
-				s = unsafe.String((*byte)(unsafe.Pointer(p.Pointer())), l)
-			}
+			s := unsafe.String((*byte)(unsafe.Pointer(p.Pointer())), l)
 			dest(f).Set(reflect.ValueOf(s).Convert(destType))
 			return next
 		}
@@ -5441,4 +5459,39 @@ func realConst(n *node) {
 		n.rval = reflect.ValueOf(real(v.Complex()))
 		n.gen = nop
 	}
+}
+
+// minMaxConst computes the constant value of a min or max call whose
+// arguments are all constants, in a constant declaration context.
+func minMaxConst(n *node) error {
+	isMin := n.child[0].ident == bltnMin
+	var best constant.Value
+	for _, c := range n.child[1:] {
+		if !c.rval.IsValid() {
+			return c.cfgErrorf("%s argument is not a constant", n.child[0].ident)
+		}
+		cv, ok := c.rval.Interface().(constant.Value)
+		if !ok {
+			if c.rval.Type().Kind() == reflect.Interface {
+				return c.cfgErrorf("%s argument is not a constant", n.child[0].ident)
+			}
+			cv = constant.Make(c.rval.Interface())
+		}
+		if best == nil {
+			best = cv
+			continue
+		}
+		op := token.GTR
+		if isMin {
+			op = token.LSS
+		}
+		if constant.Compare(cv, op, best) {
+			best = cv
+		}
+	}
+	if best == nil {
+		best = constant.MakeInt64(0)
+	}
+	n.rval = reflect.ValueOf(best)
+	return nil
 }

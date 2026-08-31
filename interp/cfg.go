@@ -106,7 +106,7 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 					n.typ = dest.typ
 				}
 			case binaryExpr, unaryExpr, parenExpr:
-				if isShiftNode(n.anc) && len(n.anc.child) > 1 && n.anc.child[1] == n {
+				if isShiftCountOf(n) {
 					// The count operand of a shift does not take the type of
 					// the shift result: it stays any integer type (per spec,
 					// the propagation above must not leak into the count).
@@ -1423,6 +1423,14 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 						lenConst(n)
 					default:
 						err = n.cfgErrorf("len argument is not an array, channel or string")
+					}
+					n.findex = notInFrame
+					n.gen = nop
+				case (bname == bltnMin || bname == bltnMax) && isInConstOrTypeDecl(n):
+					// min and max of constant arguments produce a constant
+					// result; a non constant argument is an error here.
+					if err = minMaxConst(n); err != nil {
+						break
 					}
 					n.findex = notInFrame
 					n.gen = nop
@@ -3609,4 +3617,14 @@ func sizeof(n *node) {
 	n.gen = nop
 	n.typ = n.scope.getType("uintptr")
 	n.rval = reflect.ValueOf(n.child[1].typ.TypeOf().Size())
+}
+
+// isShiftCountOf reports whether n is the count operand of a shift
+// operation, looking through parentheses.
+func isShiftCountOf(n *node) bool {
+	for a := n.anc; a != nil && a.kind == parenExpr; {
+		n = a
+		a = a.anc
+	}
+	return n.anc != nil && isShiftNode(n.anc) && len(n.anc.child) > 1 && n.anc.child[1] == n
 }

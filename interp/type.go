@@ -1557,16 +1557,6 @@ func (t *itype) assignableTo(o *itype) bool {
 		return true
 	}
 
-	// A method value on a binary type carries the receiver as the first
-	// argument of its rtype signature (the reflect.Type.Method form), while
-	// the effective bound signature excludes it. Accept the assignment when
-	// the bound signature matches the destination function type.
-	if t.cat == valueT && t.recv != nil && !isInterface(t.recv) && isFunc(t) && isFunc(o) {
-		if bound := boundMethodType(t.TypeOf()); bound != nil && bound.AssignableTo(o.TypeOf()) {
-			return true
-		}
-	}
-
 	if t.untyped && isNumber(t.TypeOf()) && isNumber(o.TypeOf()) {
 		// Assignability depends on constant numeric value (overflow check), to be tested elsewhere.
 		return true

@@ -67,6 +67,18 @@ func (check typecheck) assignment(n *node, typ *itype, context string) error {
 	}
 
 	if !n.typ.assignableTo(typ) && typ.str != "*unsafe2.dummy" {
+		// A method value on a binary type carries the receiver as the first
+		// argument of its rtype signature (the reflect.Type.Method form),
+		// while the effective bound signature excludes it. Accept the
+		// assignment when the selector base is not a type (i.e. this is a
+		// bound method value, not a method expression) and the bound
+		// signature matches the destination.
+		if nt := n.typ; n.kind == selectorExpr && !n.child[0].isType(check.scope) &&
+			nt.cat == valueT && nt.recv != nil && !isInterface(nt.recv) && isFunc(nt) && isFunc(typ) {
+			if bound := boundMethodType(nt.TypeOf()); bound != nil && bound.AssignableTo(typ.TypeOf()) {
+				return nil
+			}
+		}
 		if context == "" {
 			return n.cfgErrorf("cannot use type %s as type %s", n.typ.id(), typ.id())
 		}
@@ -1008,10 +1020,8 @@ func (check typecheck) builtin(name string, n *node, child []*node, ellipsis boo
 		}
 	case "unsafe.String":
 		t0 := params[0].Type().TypeOf()
-		ok := t0 != nil && ((t0.Kind() == reflect.Ptr && t0.Elem().Kind() == reflect.Uint8) ||
-			(t0.Kind() == reflect.Slice && t0.Elem().Kind() == reflect.Uint8))
-		if !ok {
-			return params[0].nod.cfgErrorf("invalid argument: unsafe.String requires a *byte or []byte, have %s", params[0].Type().id())
+		if t0 == nil || t0.Kind() != reflect.Ptr || t0.Elem().Kind() != reflect.Uint8 {
+			return params[0].nod.cfgErrorf("invalid argument: unsafe.String requires a *byte, have %s", params[0].Type().id())
 		}
 		if t1 := params[1].Type().TypeOf(); !isInt(t1) {
 			return params[1].nod.cfgErrorf("invalid argument: unsafe.String length must be an integer, have %s", params[1].Type().id())

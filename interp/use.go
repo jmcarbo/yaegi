@@ -57,6 +57,11 @@ func (interp *Interpreter) Symbols(importPath string) Exports {
 				interp.publishHostValueLocked(value, true)
 				syms[n] = value
 			case typeSym:
+				// Generic (uninstantiated) types have no reflect type yet:
+				// reflect.New on a nil type would panic.
+				if s.typ == nil || isGeneric(s.typ) || s.typ.TypeOf() == nil {
+					continue
+				}
 				syms[n] = reflect.New(s.typ.TypeOf())
 			}
 		}

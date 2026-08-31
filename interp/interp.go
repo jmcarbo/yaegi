@@ -1346,7 +1346,7 @@ func (interp *Interpreter) ImportUsed() {
 			sc.sym[key2name(fixKey(k))] = &symbol{kind: pkgSym, typ: &itype{cat: binPkgT, path: k, scope: sc}}
 			continue
 		}
-		if sym, ok := sc.sym[name]; ok {
+		if sym, ok := sc.sym[name]; ok && sym.kind == pkgSym && sym.typ != nil {
 			// Handle collision with a pre-existing symbol by renaming the old
 			// entry, then bind the plain name to the new package.
 			name2 := key2name(fixKey(sym.typ.path))

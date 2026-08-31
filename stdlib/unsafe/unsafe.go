@@ -77,5 +77,5 @@ func uintptrToUnsafePtr(src, dest reflect.Value) {
 // interp unsafeBuiltin), like the other unsafe builtins above.
 var (
 	slicePlaceholder  = func(ptr interface{}, len int) interface{} { return nil }
-	stringPlaceholder = func(data []byte, len int) string { return "" }
+	stringPlaceholder = func(data *byte, len int) string { return "" }
 )
