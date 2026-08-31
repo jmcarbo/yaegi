@@ -524,7 +524,9 @@ func runCfg(n *node, f *frame, funcNode, callNode *node) {
 
 	dbg := n.interp.debugger
 	if dbg == nil {
-		for exec := n.exec; exec != nil && !f.canceled(); {
+		// Assign to the outer exec, not a shadow: the deferred recovery above
+		// reads it to locate the failing node for the panic position.
+		for exec = n.exec; exec != nil && !f.canceled(); {
 			exec = execWithFuncSweepFence(exec, f)
 		}
 		return

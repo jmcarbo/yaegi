@@ -1056,12 +1056,24 @@ func nodeType2(interp *Interpreter, sc *scope, n *node, seen []*node) (t *itype,
 		}
 		var incomplete bool
 		fields := make([]structField, 0, len(n.child[0].child))
+		fail := func(err error) (*itype, error) {
+			// The partially built struct may already be registered in the
+			// scope symbol: mark it incomplete so a retry rebuilds it instead
+			// of returning the bogus type as complete.
+			if t != nil {
+				t.incomplete = true
+			}
+			if sym != nil && sym.typ != nil {
+				sym.typ.incomplete = true
+			}
+			return nil, err
+		}
 		for _, c := range n.child[0].child {
 			switch {
 			case len(c.child) == 1:
 				typ, err := nodeType2(interp, sc, c.child[0], seen)
 				if err != nil {
-					return nil, err
+					return fail(err)
 				}
 				fields = append(fields, structField{name: fieldName(c.child[0]), embed: true, typ: typ})
 				incomplete = incomplete || typ.incomplete
@@ -1069,7 +1081,7 @@ func nodeType2(interp *Interpreter, sc *scope, n *node, seen []*node) (t *itype,
 				tag := vString(c.child[1].rval)
 				typ, err := nodeType2(interp, sc, c.child[0], seen)
 				if err != nil {
-					return nil, err
+					return fail(err)
 				}
 				fields = append(fields, structField{name: fieldName(c.child[0]), embed: true, typ: typ, tag: tag})
 				incomplete = incomplete || typ.incomplete
@@ -1082,7 +1094,7 @@ func nodeType2(interp *Interpreter, sc *scope, n *node, seen []*node) (t *itype,
 				}
 				typ, err := nodeType2(interp, sc, c.child[l-1], seen)
 				if err != nil {
-					return nil, err
+					return fail(err)
 				}
 				incomplete = incomplete || typ.incomplete
 				for _, d := range c.child[:l-1] {
@@ -1126,6 +1138,13 @@ func nodeType2(interp *Interpreter, sc *scope, n *node, seen []*node) (t *itype,
 		t.str = t.path + "." + t.name
 	case t.cat == nilT:
 		t.str = "nil"
+	}
+
+	if t == nil && err == nil {
+		// An unresolvable type node must carry an error: a nil type with no
+		// error is stored or dereferenced by callers (gta revisit, cfg) as if
+		// it were valid, and panics later.
+		err = n.cfgErrorf("undefined type")
 	}
 
 	return t, err

@@ -476,6 +476,11 @@ func (interp *Interpreter) gtaRetry(nodes []*node, importPath, pkgName string) e
 		n := revisit[0]
 		switch n.kind {
 		case typeSpec, typeSpecAssign:
+			if n.typ == nil {
+				// The type never resolved: report it instead of dereferencing
+				// a nil type below.
+				return n.cfgErrorf("undefined type: %s", n.child[0].ident)
+			}
 			if err := definedType(n.typ); err != nil {
 				return err
 			}

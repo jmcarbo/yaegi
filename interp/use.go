@@ -37,6 +37,15 @@ func (interp *Interpreter) Symbols(importPath string) Exports {
 			case constSym:
 				syms[n] = s.rval
 			case funcSym:
+				// Generic (uninstantiated) functions have no monomorphic
+				// wrapper: wrapping them would call reflect.MakeFunc on a
+				// non-func type and panic. Skip them.
+				if s.node.typ == nil || isGeneric(s.node.typ) {
+					continue
+				}
+				if rt := s.node.typ.TypeOf(); rt == nil || rt.Kind() != reflect.Func {
+					continue
+				}
 				value := genFunctionWrapper(s.node)(interp.frame)
 				interp.publishHostValueLocked(value, false)
 				syms[n] = value
