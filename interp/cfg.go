@@ -3470,12 +3470,22 @@ func matchSelectorMethod(sc *scope, n *node) (err error) {
 		n.action = aGetMethod
 		if n.child[0].isType(sc) {
 			// Handle method as a function with receiver in 1st argument.
+			// The method expression is a func value: the receiver is not
+			// bound, it is provided at call time as first argument (#1499).
 			n.val = m
-			n.findex = notInFrame
-			n.gen = nop
+			n.gen = getMethodExpr
+			// The nil receiver node marks an unbound receiver. The embedded
+			// field indexes are kept, so the wrapper can project an outer
+			// receiver onto the embedded receiver of a promoted method.
+			n.recv = &receiver{index: lind}
 			n.typ = &itype{}
 			*n.typ = *m.typ
 			n.typ.arg = append([]*itype{n.child[0].typ}, m.typ.arg...)
+			// The original method type may already have a cached reflect type
+			// and id string, computed without the prepended receiver: reset
+			// them, so they are recomputed for the method expression type.
+			n.typ.rtype = nil
+			n.typ.str = funcOf(n.typ.arg, n.typ.ret).str
 		} else {
 			// Handle method with receiver.
 			n.gen = getMethod

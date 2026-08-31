@@ -1575,7 +1575,10 @@ func genFunctionWrapper(n *node) func(*frame) reflect.Value {
 	numRet := len(def.typ.ret)
 	var rcvr func(*frame) reflect.Value
 
-	if n.recv != nil {
+	// A receiver with no node and no value marks an unbound receiver (method
+	// expression): the receiver is provided at call time as first argument,
+	// there is nothing to read from the frame.
+	if n.recv != nil && (n.recv.node != nil || n.recv.val.IsValid()) {
 		rcvr = genValueRecv(n)
 	}
 	value := genValue(n)
@@ -1655,6 +1658,13 @@ func invokeInterpretedHostBoundary(interp *Interpreter, typ reflect.Type, invoke
 func buildDeclaredFunctionWrapper(n, def *node, base *frame, receiver reflect.Value, root *frame, cancel <-chan struct{}) interpretedFuncBuild {
 	numRet := len(def.typ.ret)
 	start := def.child[3].start
+	// An unbound method wrapper (from a method expression) receives the method
+	// receiver as its first call argument, before the method own arguments.
+	unbound := !receiver.IsValid() && def.typ.recv != nil
+	argTypes := def.typ.arg
+	if unbound {
+		argTypes = append([]*itype{def.typ.recv}, def.typ.arg...)
+	}
 	invoke := func(in []reflect.Value, root *frame, cancel <-chan struct{}) []reflect.Value {
 		// Allocate and init local frame. All values to be settable and addressable.
 		fr := newFrame(base, len(def.types), base.runid())
@@ -1699,7 +1709,13 @@ func buildDeclaredFunctionWrapper(n, def *node, base *frame, receiver reflect.Va
 				// In case of unused arg, there may be not even a frame entry allocated, just skip.
 				break
 			}
-			typ := def.typ.arg[i]
+			if unbound && i == 0 {
+				// The first argument is the method receiver: project it onto
+				// the embedded receiver of a promoted method if any, and
+				// accommodate a pointer or value base in the expression.
+				arg = unboundMethodReceiver(n, arg, d[i].Kind())
+			}
+			typ := argTypes[i]
 			switch {
 			case isEmptyInterface(typ) || typ.TypeOf() == valueInterfaceType:
 				d[i].Set(arg)
@@ -1727,6 +1743,40 @@ func buildDeclaredFunctionWrapper(n, def *node, base *frame, receiver reflect.Va
 		return buildDeclaredFunctionWrapper(n, def, clonedBase, clonedReceiver, c.newRoot, c.cancel)
 	}
 	return interpretedFuncBuild{value: wrapper, invoke: invoke, rebind: rebind}
+}
+
+// unboundMethodReceiver adapts the first call argument of an unbound method
+// (a method expression) to the method receiver expected by the method frame:
+// it projects an outer receiver onto the embedded field declaring a promoted
+// method, and accommodates a value or pointer base in the expression.
+func unboundMethodReceiver(n *node, src reflect.Value, destKind reflect.Kind) reflect.Value {
+	if n.recv != nil {
+		for _, i := range n.recv.index {
+			if src.Kind() == reflect.Ptr {
+				src = src.Elem()
+			}
+			src = src.Field(i)
+			if vi, ok := src.Interface().(valueInterface); ok {
+				src = vi.value
+			}
+		}
+	}
+	switch {
+	case src.Kind() == reflect.Ptr && destKind != reflect.Ptr:
+		// A value-receiver method selected through a pointer base: the
+		// receiver is a copy of the pointed value, as in native Go.
+		return src.Elem()
+	case src.Kind() != reflect.Ptr && destKind == reflect.Ptr:
+		// A pointer-receiver method with a value base can only occur on an
+		// addressable projection of the receiver argument.
+		if !src.CanAddr() {
+			c := reflect.New(src.Type()).Elem()
+			c.Set(src)
+			src = c
+		}
+		return src.Addr()
+	}
+	return src
 }
 
 func genInterfaceWrapper(n *node, typ reflect.Type) func(*frame) reflect.Value {
@@ -2801,6 +2851,27 @@ func getMethod(n *node) {
 	n.exec = func(f *frame) bltn {
 		nod := *n.val.(*node)
 		nod.val = &nod
+		nod.recv = n.recv
+		getFrame(f, l).data[i] = genFuncValue(&nod)(f)
+		return next
+	}
+}
+
+// getMethodExpr generates the func value of a method expression on an
+// interpreted type (for example (*T).M). The value is a func taking the
+// receiver as first argument, not a method bound to a receiver (#1499).
+func getMethodExpr(n *node) {
+	i := n.findex
+	l := n.level
+	next := getExec(n.tnext)
+
+	n.exec = func(f *frame) bltn {
+		nod := *n.val.(*node)
+		nod.val = &nod
+		// Give the method copy the method expression type, where the receiver
+		// is the first argument, and keep the unbound receiver marker, so the
+		// generated wrapper reads the receiver from the first call argument.
+		nod.typ = n.typ
 		nod.recv = n.recv
 		getFrame(f, l).data[i] = genFuncValue(&nod)(f)
 		return next
