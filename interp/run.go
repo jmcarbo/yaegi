@@ -3760,11 +3760,17 @@ func doComposite(n *node, hasType bool, keyed bool) {
 		switch {
 		case d.Kind() == reflect.Ptr:
 			setOwnedValueOutput(f, d, a.Addr())
+		case destInterface && len(destType(n).field) > 0 && d.Type() == valueInterfaceType:
+			// The enclosing assignment was inlined into this composite
+			// literal: the destination cell is frame-typed as valueInterface,
+			// so store the interpreted interface representation directly.
+			setOwnedValueOutput(f, d, reflect.ValueOf(valueInterface{n, a}))
 		case destInterface:
-			if len(destType(n).field) > 0 {
-				setOwnedValueOutput(f, d, reflect.ValueOf(valueInterface{n, a}))
-				break
-			}
+			// The composite result goes to its own frame slot (the assignment
+			// was not inlined, i.e. the destination is a struct field, a
+			// dereferenced pointer or a binary interface). Keep the value
+			// concrete: the valueInterface wrapper is added later by the
+			// assignment itself (see genDestValue).
 			setOwnedValueOutput(f, d, a)
 		default:
 			if n.anc.kind == assignStmt && n.anc.action == aAssign {
