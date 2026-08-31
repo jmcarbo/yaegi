@@ -1,6 +1,7 @@
 package interp
 
 import (
+	"os"
 	"errors"
 	"go/constant"
 	"go/token"
@@ -273,6 +274,9 @@ func (check typecheck) binaryExpr(n *node) error {
 	// Ensure that if values are untyped, both are converted to the same type
 	_ = check.convertUntyped(c0, c1.typ)
 	_ = check.convertUntyped(c1, c0.typ)
+	if os.Getenv("YAEGI_DBG_BIN") != "" && (n.action == aAnd || n.action == aAdd) {
+		println("DBG bin", n.action.String(), n.interp.fset.Position(n.pos).String(), "c0:", c0.kind.String(), c0.typ.id(), "c1:", c1.kind.String(), c1.typ.id(), "n.typ:", func() string { if n.typ == nil { return "nil" }; return n.typ.id() }())
+	}
 
 	if isComparisonAction(a) {
 		return check.comparison(n)
