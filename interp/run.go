@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"unsafe"
 )
 
 // bltn type defines functions which run at CFG execution.
@@ -308,10 +309,22 @@ func isExecNode(n *node, exec bltn) bool {
 	return a1 == a2
 }
 
+// execIdentity returns the funcval address of a builtin closure: the single
+// pointer word of a func variable. Unlike reflect.Value.Pointer(), which
+// returns the shared code pointer for closures created by the same generator,
+// the funcval address is unique per closure instance and identifies the exact
+// node exec.
+func execIdentity(exec bltn) uintptr {
+	if exec == nil {
+		return 0
+	}
+	return *(*uintptr)(unsafe.Pointer(&exec))
+}
+
 // originalExecNode looks in the tree of nodes for the node which has exec,
 // aside from n, in order to know where n "inherited" that exec from.
 func originalExecNode(n *node, exec bltn) *node {
-	execAddr := reflect.ValueOf(exec).Pointer()
+	execAddr := execIdentity(exec)
 	var originalNode *node
 	seen := make(map[int64]struct{})
 	root := n
@@ -335,7 +348,7 @@ func originalExecNode(n *node, exec bltn) *node {
 			if wn.exec == nil {
 				return true
 			}
-			if reflect.ValueOf(wn.exec).Pointer() == execAddr {
+			if execIdentity(wn.exec) == execAddr {
 				originalNode = wn
 				return false
 			}
