@@ -1875,16 +1875,44 @@ func methodByName(value reflect.Value, name string, index []int) (v reflect.Valu
 	if v = value.MethodByName(name); v.IsValid() {
 		return
 	}
+	if value.Kind() == reflect.Struct {
+		// The method may be promoted from an embedded struct field: get it
+		// from the field at the index path computed at compile time.
+		if checkFieldIndex(value.Type(), index) {
+			v = methodFromField(value.FieldByIndex(index), name)
+		}
+		return
+	}
 	for value.Kind() == reflect.Ptr {
 		value = value.Elem()
 		if checkFieldIndex(value.Type(), index) {
 			value = value.FieldByIndex(index)
+			// The promoted method may have a pointer receiver: get it from
+			// the address of the embedded field.
+			if v = methodFromField(value, name); v.IsValid() {
+				return
+			}
+			continue
 		}
 		if v = value.MethodByName(name); v.IsValid() {
 			return
 		}
 	}
 	return
+}
+
+// methodFromField returns the method name of a struct field, with either a
+// value receiver or, if the field is addressable, a pointer receiver.
+func methodFromField(field reflect.Value, name string) reflect.Value {
+	if v := field.MethodByName(name); v.IsValid() {
+		return v
+	}
+	if field.CanAddr() {
+		if v := field.Addr().MethodByName(name); v.IsValid() {
+			return v
+		}
+	}
+	return reflect.Value{}
 }
 
 func checkFieldIndex(typ reflect.Type, index []int) bool {
@@ -2311,7 +2339,12 @@ func callBin(n *node) {
 			} else {
 				defType = funcType.In(rcvrOffset + i)
 			}
-			if getMapType != nil {
+			// The interface wrapper substitution is only valid for empty
+			// interface arguments (including elements of a variadic empty
+			// interface parameter): a wrapper type of another interface
+			// would not match a non empty interface parameter at call time.
+			if getMapType != nil && (defType == emptyInterfaceType ||
+				(defType.Kind() == reflect.Slice && defType.Elem() == emptyInterfaceType)) {
 				if rt := getMapType(c.typ); rt != nil {
 					defType = rt
 				}

@@ -278,12 +278,15 @@ func getConcreteValue(val reflect.Value) reflect.Value {
 	if v.Kind() != reflect.Struct {
 		return v
 	}
-	// Search a concrete value in fields of an emulated interface.
+	// Search a concrete value in fields of an emulated interface. Only
+	// interface fields are unwrapped: other struct values must be returned
+	// unmodified, as their fields are not a substitute for the value itself.
 	for i := v.NumField() - 1; i >= 0; i-- {
 		vv := v.Field(i)
-		if vv.Kind() == reflect.Interface {
-			vv = vv.Elem()
+		if vv.Kind() != reflect.Interface {
+			continue
 		}
+		vv = vv.Elem()
 		if vv.IsValid() {
 			return vv
 		}

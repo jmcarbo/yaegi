@@ -2359,7 +2359,27 @@ func (t *itype) implements(it *itype) bool {
 		}
 		return t.TypeOf().Implements(it.TypeOf())
 	}
-	return t.methods().contains(it.methods())
+	if t.methods().contains(it.methods()) {
+		return true
+	}
+	// The method set of an interpreted type may miss methods promoted from
+	// embedded binary fields, because reflect does not compute the method set
+	// of interpreted struct types (reflect.StructOf does not promote the
+	// methods of embedded fields). Use the same method lookup as for a
+	// selector on t, which traverses embedded fields, so an interpreted struct
+	// embedding a binary type can satisfy a binary interface (see #1480 and
+	// #1502). This mirrors the method lookup performed at runtime by
+	// genInterfaceWrapper.
+	for name := range it.methods() {
+		if m, _ := t.lookupMethod(name); m != nil {
+			continue
+		}
+		if _, _, _, ok := t.lookupBinMethod(name); ok {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // defaultType returns the default type of an untyped type.
