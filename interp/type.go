@@ -1512,6 +1512,16 @@ func (t *itype) assignableTo(o *itype) bool {
 		return true
 	}
 
+	// A method value on a binary type carries the receiver as the first
+	// argument of its rtype signature (the reflect.Type.Method form), while
+	// the effective bound signature excludes it. Accept the assignment when
+	// the bound signature matches the destination function type.
+	if t.cat == valueT && t.recv != nil && !isInterface(t.recv) && isFunc(t) && isFunc(o) {
+		if bound := boundMethodType(t.TypeOf()); bound != nil && bound.AssignableTo(o.TypeOf()) {
+			return true
+		}
+	}
+
 	if t.untyped && isNumber(t.TypeOf()) && isNumber(o.TypeOf()) {
 		// Assignability depends on constant numeric value (overflow check), to be tested elsewhere.
 		return true
@@ -2406,6 +2416,23 @@ func chanElement(t *itype) *itype {
 func isBool(t *itype) bool { return t.TypeOf().Kind() == reflect.Bool }
 func isChan(t *itype) bool { return t.TypeOf().Kind() == reflect.Chan }
 func isFunc(t *itype) bool { return t.TypeOf().Kind() == reflect.Func }
+
+// boundMethodType returns the signature of a bound method value obtained from
+// a reflect.Type.Method signature: the receiver (first input) is removed.
+func boundMethodType(rt reflect.Type) reflect.Type {
+	if rt == nil || rt.Kind() != reflect.Func || rt.NumIn() == 0 {
+		return nil
+	}
+	ins := make([]reflect.Type, rt.NumIn()-1)
+	for i := range ins {
+		ins[i] = rt.In(i + 1)
+	}
+	outs := make([]reflect.Type, rt.NumOut())
+	for i := range outs {
+		outs[i] = rt.Out(i)
+	}
+	return reflect.FuncOf(ins, outs, rt.IsVariadic())
+}
 func isMap(t *itype) bool  { return t.TypeOf().Kind() == reflect.Map }
 func isPtr(t *itype) bool  { return t.TypeOf().Kind() == reflect.Ptr }
 

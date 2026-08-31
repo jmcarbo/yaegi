@@ -824,6 +824,17 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 						}
 						if src.typ.isBinMethod {
 							dest.typ = valueTOf(src.typ.methodCallType())
+						} else if src.typ.cat == valueT && src.typ.recv != nil && !isInterface(src.typ.recv) && isFunc(src.typ) {
+							// A method value on a binary type: the rtype still
+							// carries the receiver as first argument (reflect
+							// Type.Method form), but the value produced at run
+							// time is bound. Type the destination with the
+							// bound signature.
+							if bt := boundMethodType(src.typ.TypeOf()); bt != nil {
+								dest.typ = valueTOf(bt, withScope(sc))
+							} else {
+								dest.typ = sc.fixType(src.typ)
+							}
 						} else {
 							// In a new definition, propagate the source type to the destination
 							// type. If the source is an untyped constant, make sure that the
