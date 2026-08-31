@@ -162,3 +162,24 @@
   capture any slot), and the scheduler-level one-shot declaration remains
   rejected. Severity is REPL-shaped (thousands of func-Evals on one
   interpreter); behavior is otherwise master-compatible.
+- Binary calls whose parameter is exactly `interface{}` (non-variadic) pass
+  the concrete underlying value, with valueInterface boxes and generated
+  interface wrapper structs (`IValue` + `W*` func fields) unwrapped at the
+  call boundary (scalar; slices/maps copied only when an element is wrapped,
+  so in-place mutation by binary code is preserved for unwrapped elements).
+  This is what lets encoding/json reflect over interpreted values held in
+  non-empty interfaces (#633). Method dispatch is unchanged where it matters:
+  non-empty interface parameters keep wrappers, variadic `...any` (fmt
+  family) still re-wraps at run time via getBinValue/mapTypes, and a
+  valueInterface whose node matches the caller's mapTypes (json.Marshaler for
+  json.Marshal) is wrapped instead of unwrapped. Accepted trade-off: a value
+  that crossed a binary `any` boundary is stored concrete, so a later
+  interpreted type assertion to a NON-empty interface on it fails for
+  wrapper-less interpreted dynamic types (concrete assertions now succeed, as
+  natively). The interface wrapper constructor also stores the whole concrete
+  value in the wrapper first field (only valueInterface layers are stripped),
+  so `ifaceVar.(Concrete)` works and wrappers marshal to the full struct.
+  Residual: per-element Marshaler dispatch for slices of marshaler-bearing
+  structs (#1486) is untouched, and MarshalJSON behind a binary-interface
+  variable is not invoked (the wrapper carries no node, so mapTypes cannot
+  match the concrete type).
