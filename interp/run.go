@@ -3742,6 +3742,15 @@ func genRangeStore(n *node) func(*frame) func(reflect.Value) {
 				return func(value reflect.Value) { setOwnedValueOutput(f, destination, value) }
 			}
 		case selectorExpr:
+			if isBinPkgVar(n) {
+				// The destination is the live host cell exposed as the node
+				// value; the interpreter frame slot is not its storage.
+				return func(f *frame) func(reflect.Value) {
+					runRangeTargetPrelude(n, f)
+					destination := n.val.(reflect.Value)
+					return func(value reflect.Value) { setOwnedValueOutput(f, destination, value) }
+				}
+			}
 			receiver := genValue(n.child[0])
 			index, ok := n.val.([]int)
 			if ok {
