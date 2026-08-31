@@ -2,10 +2,10 @@ package interp
 
 import (
 	"reflect"
-
-	"github.com/traefik/yaegi/stdlib"
 	"strings"
 	"testing"
+
+	"github.com/traefik/yaegi/stdlib"
 )
 
 // TestUpstreamIssue1069 checks that a void statement or call does not return

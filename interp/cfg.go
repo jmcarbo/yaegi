@@ -1379,7 +1379,7 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				}
 
 				n.gen = c0.sym.builtin
-				if bname == "unsafe.Slice" || bname == "unsafe.String" {
+				if bname == bltnUnsafeSlice || bname == bltnUnsafeString {
 					// The result type is a slice or string, not builtinT:
 					// set the generator here, the builtinT switch below is
 					// not reached.

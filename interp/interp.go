@@ -823,6 +823,9 @@ const (
 	bltnReal     = "real"
 	bltnRecover  = "recover"
 	bltnSizeof   = "unsafe.Sizeof"
+
+	bltnUnsafeSlice  = "unsafe.Slice"
+	bltnUnsafeString = "unsafe.String"
 )
 
 func initUniverse() *scope {

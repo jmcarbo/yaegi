@@ -4612,7 +4612,7 @@ func unsafeBuiltin(n *node) {
 	dest := genValueOutput(n, n.typ.TypeOf())
 	value0 := genValue(n.child[1])
 	value1 := genValue(n.child[2])
-	isStringB := n.child[0].ident == "unsafe.String"
+	isStringB := n.child[0].ident == bltnUnsafeString
 	destType := n.typ.TypeOf()
 
 	n.exec = func(f *frame) bltn {
@@ -4644,7 +4644,7 @@ func unsafeBuiltin(n *node) {
 			panic("unsafe.Slice: len out of range")
 		}
 		s := reflect.New(destType).Elem()
-		h := (*reflect.SliceHeader)(unsafe.Pointer(s.UnsafeAddr())) //nolint:gosec
+		h := (*reflect.SliceHeader)(unsafe.Pointer(s.UnsafeAddr())) //nolint:gosec,staticcheck
 		h.Data = p.Pointer()
 		h.Len = l
 		h.Cap = l

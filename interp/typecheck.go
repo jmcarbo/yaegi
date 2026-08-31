@@ -754,28 +754,28 @@ var builtinFuncs = map[string]struct {
 	args     int
 	variadic bool
 }{
-	bltnAlignof:     {args: 1, variadic: false},
-	bltnAppend:      {args: 1, variadic: true},
-	bltnCap:         {args: 1, variadic: false},
-	bltnClose:       {args: 1, variadic: false},
-	bltnComplex:     {args: 2, variadic: false},
-	bltnImag:        {args: 1, variadic: false},
-	bltnCopy:        {args: 2, variadic: false},
-	bltnDelete:      {args: 2, variadic: false},
-	bltnLen:         {args: 1, variadic: false},
-	bltnMake:        {args: 1, variadic: true},
-	bltnMax:         {args: 1, variadic: true},
-	bltnMin:         {args: 1, variadic: true},
-	bltnNew:         {args: 1, variadic: false},
-	bltnOffsetof:    {args: 1, variadic: false},
-	bltnPanic:       {args: 1, variadic: false},
-	bltnPrint:       {args: 0, variadic: true},
-	bltnPrintln:     {args: 0, variadic: true},
-	bltnReal:        {args: 1, variadic: false},
-	bltnRecover:     {args: 0, variadic: false},
-	bltnSizeof:      {args: 1, variadic: false},
-	"unsafe.Slice":  {args: 2, variadic: false},
-	"unsafe.String": {args: 2, variadic: false},
+	bltnAlignof:      {args: 1, variadic: false},
+	bltnAppend:       {args: 1, variadic: true},
+	bltnCap:          {args: 1, variadic: false},
+	bltnClose:        {args: 1, variadic: false},
+	bltnComplex:      {args: 2, variadic: false},
+	bltnImag:         {args: 1, variadic: false},
+	bltnCopy:         {args: 2, variadic: false},
+	bltnDelete:       {args: 2, variadic: false},
+	bltnLen:          {args: 1, variadic: false},
+	bltnMake:         {args: 1, variadic: true},
+	bltnMax:          {args: 1, variadic: true},
+	bltnMin:          {args: 1, variadic: true},
+	bltnNew:          {args: 1, variadic: false},
+	bltnOffsetof:     {args: 1, variadic: false},
+	bltnPanic:        {args: 1, variadic: false},
+	bltnPrint:        {args: 0, variadic: true},
+	bltnPrintln:      {args: 0, variadic: true},
+	bltnReal:         {args: 1, variadic: false},
+	bltnRecover:      {args: 0, variadic: false},
+	bltnSizeof:       {args: 1, variadic: false},
+	bltnUnsafeSlice:  {args: 2, variadic: false},
+	bltnUnsafeString: {args: 2, variadic: false},
 }
 
 func (check typecheck) builtin(name string, n *node, child []*node, ellipsis bool) error {
@@ -1010,7 +1010,7 @@ func (check typecheck) builtin(name string, n *node, child []*node, ellipsis boo
 		}
 	case bltnRecover, bltnNew, bltnAlignof, bltnOffsetof, bltnSizeof:
 		// Nothing to do.
-	case "unsafe.Slice":
+	case bltnUnsafeSlice:
 		t0 := params[0].Type().TypeOf()
 		if t0 == nil || t0.Kind() != reflect.Ptr {
 			return params[0].nod.cfgErrorf("invalid argument: unsafe.Slice requires a pointer, have %s", params[0].Type().id())
@@ -1018,7 +1018,7 @@ func (check typecheck) builtin(name string, n *node, child []*node, ellipsis boo
 		if t1 := params[1].Type().TypeOf(); !isInt(t1) {
 			return params[1].nod.cfgErrorf("invalid argument: unsafe.Slice length must be an integer, have %s", params[1].Type().id())
 		}
-	case "unsafe.String":
+	case bltnUnsafeString:
 		t0 := params[0].Type().TypeOf()
 		if t0 == nil || t0.Kind() != reflect.Ptr || t0.Elem().Kind() != reflect.Uint8 {
 			return params[0].nod.cfgErrorf("invalid argument: unsafe.String requires a *byte, have %s", params[0].Type().id())
@@ -1097,8 +1097,8 @@ func (check typecheck) argument(p param, ftyp *itype, i, l int, ellipsis bool) e
 			return p.nod.cfgErrorf("can only use ... with matching parameter")
 		}
 		t := p.Type().TypeOf()
-		if t.Kind() != reflect.Slice || !(valueTOf(t.Elem())).assignableTo(atyp) {
-			return p.nod.cfgErrorf("cannot use %s as type %s", p.nod.typ.id(), (sliceOf(atyp)).id())
+		if t.Kind() != reflect.Slice || !valueTOf(t.Elem()).assignableTo(atyp) {
+			return p.nod.cfgErrorf("cannot use %s as type %s", p.nod.typ.id(), sliceOf(atyp).id())
 		}
 		return nil
 	}
