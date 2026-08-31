@@ -1,6 +1,7 @@
 package interp
 
 import (
+	"errors"
 	"fmt"
 	"go/constant"
 	"path"
@@ -2092,6 +2093,12 @@ type refTypeContext struct {
 	slevel     int
 }
 
+// invalidRecursiveTypeMsg is the marker of an invalid recursive type
+// rejection (a value cycle through named struct fields). It is panic-ed from
+// the type algebra, where no error return is available, and recovered into a
+// compilation error at the cfg boundary.
+const invalidRecursiveTypeMsg = "invalid recursive type"
+
 // Clone creates a copy of the ref type context.
 func (c *refTypeContext) Clone() *refTypeContext {
 	return &refTypeContext{defined: c.defined, refs: c.refs, rebuilding: c.rebuilding}
@@ -2244,9 +2251,19 @@ func (t *itype) refType(ctx *refTypeContext) reflect.Type {
 		ctx.slevel++
 		var fields []reflect.StructField
 		for _, f := range t.field {
+			frt := f.typ.refType(ctx)
+			if frt == unsafe2.DummyType && !ctx.rebuilding {
+				// A named struct type used as a value (non pointer, non
+				// slice, non map, non func) field while its own runtime type
+				// is still under construction is an invalid recursive type:
+				// the compiler rejects it, and building it would create a
+				// cyclic runtime type graph which crashes reflect as soon as
+				// the type graph is walked (upstream issue #1534).
+				panic(errors.New(invalidRecursiveTypeMsg + " in " + name + ": field " + f.name + " " + f.typ.id()))
+			}
 			field := reflect.StructField{
 				Name: exportName(f.name),
-				Type: f.typ.refType(ctx),
+				Type: frt,
 				Tag:  reflect.StructTag(f.tag),
 			}
 			if len(t.field) == 1 && f.embed {
@@ -2271,12 +2288,17 @@ func (t *itype) refType(ctx *refTypeContext) reflect.Type {
 		}
 		fieldFix := []fixStructField{} // Slice of field indices to fix for recursivity.
 		t.rtype = reflect.StructOf(fields)
+		t.registerRtype()
 		if ctx.isComplete() {
 			for _, s := range ctx.defined {
 				for i := 0; i < s.rtype.NumField(); i++ {
 					f := s.rtype.Field(i)
 					if strings.HasSuffix(f.Type.String(), "unsafe2.dummy") {
-						unsafe2.SetFieldType(s.rtype, i, ctx.rect.fixDummy(s.rtype.Field(i).Type))
+						// Patch from the field's own declared type: the shared
+						// ctx.rect may point to a different under-construction
+						// struct, silently corrupting field types.
+						ftyp := s.field[i].typ.refType(&refTypeContext{defined: ctx.defined, rebuilding: true})
+						unsafe2.SetFieldType(s.rtype, i, ftyp)
 						if name == s.path+"/"+s.name {
 							fieldFix = append(fieldFix, fixStructField{s.name, i})
 						}
@@ -2316,6 +2338,25 @@ func (t *itype) refType(ctx *refTypeContext) reflect.Type {
 // TypeOf returns the reflection type of dynamic interpreter type t.
 func (t *itype) TypeOf() reflect.Type {
 	return t.refType(nil)
+}
+
+// registerRtype maintains the reverse mapping from the reflect type generated
+// for a named interpreted struct type to this interpreted type, so values
+// passed unwrapped to binary code (see genValueConcrete) can be traced back to
+// their interpreter type at run time by the reflect method bridge. Named only:
+// anonymous or binary types need no reverse mapping.
+func (t *itype) registerRtype() {
+	if t.rtype == nil || t.name == "" || t.cat != structT {
+		return
+	}
+	var in *Interpreter
+	if t.node != nil {
+		in = t.node.interp
+	}
+	if in == nil {
+		return
+	}
+	in.setRtypeItype(t.rtype, t)
 }
 
 func (t *itype) frameType() (r reflect.Type) {

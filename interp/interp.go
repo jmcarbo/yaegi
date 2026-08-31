@@ -618,6 +618,19 @@ type Interpreter struct {
 
 	hooks *hooks // symbol hooks
 
+	// bridges holds the host-bridge tables (see bridge.go): the catalog of
+	// native box types registered in binary packages, the per-type match
+	// caches, and host-registered interface bridges.
+	bridgeOnce sync.Once
+	bridges    *bridgeState
+	// rtoitype maps a generated reflect type back to the interpreted type it
+	// was built from. It is populated when an interpreted struct rtype is
+	// computed (see itype.registerRtype), and consumed by the reflect.Value
+	// method bridge (see getIndexBinValueMethod), to surface interpreted
+	// methods on values which crossed a binary empty interface boundary.
+	rtoitype   map[reflect.Type]*itype
+	rtoitypeMu sync.RWMutex
+
 	debugger *Debugger
 }
 
@@ -662,6 +675,42 @@ var Symbols = Exports{
 
 func init() { Symbols[selfPath]["Symbols"] = reflect.ValueOf(Symbols) }
 
+// setRtypeItype records a reverse mapping from a generated reflect type to the
+// interpreted type it was built from. Keys for both T and *T are recorded for
+// struct types, as the raw value seen on the binary side may be either.
+func (interp *Interpreter) setRtypeItype(rt reflect.Type, t *itype) {
+	if rt == nil || t == nil {
+		return
+	}
+	interp.rtoitypeMu.Lock()
+	if interp.rtoitype == nil {
+		interp.rtoitype = map[reflect.Type]*itype{}
+	}
+	interp.rtoitype[rt] = t
+	if rt.Kind() == reflect.Struct {
+		interp.rtoitype[reflect.PtrTo(rt)] = t
+	}
+	interp.rtoitypeMu.Unlock()
+}
+
+// rtypeItype returns the interpreted type registered for a concrete reflect
+// type, or nil. Pointer indirection is resolved first, so a raw *T maps to the
+// interpreted type of T.
+func (interp *Interpreter) rtypeItype(rt reflect.Type) *itype {
+	if rt == nil {
+		return nil
+	}
+	if rt.Kind() == reflect.Ptr {
+		if t := interp.rtypeItype(rt.Elem()); t != nil {
+			return t
+		}
+	}
+	interp.rtoitypeMu.RLock()
+	t := interp.rtoitype[rt]
+	interp.rtoitypeMu.RUnlock()
+	return t
+}
+
 // _error is a wrapper of error interface type.
 type _error struct {
 	IValue interface{}
@@ -669,6 +718,91 @@ type _error struct {
 }
 
 func (w _error) Error() string { return w.WError() }
+
+// As implements interface{ As(any) bool }, consulted by errors.As when the
+// chain link does not match the target by assignability. It matches only
+// _errorCell out-parameter boxes whose Want is the exact native type of the
+// interpreted value this box carries: the interpreted target cell then
+// receives the chain link, and the callBin write-back moves it into the
+// interpreted variable. Assignability of a plain _error to a *_errorCell
+// never succeeds (distinct types), so native matching semantics are kept:
+// the Want of the target alone decides, never the receiver's.
+func (w _error) As(target any) bool {
+	cell, ok := target.(*_errorCell)
+	if !ok || cell == nil || w.IValue == nil {
+		return false
+	}
+	if reflect.TypeOf(w.IValue) != cell.Want {
+		return false
+	}
+	cell._error = w
+	return true
+}
+
+// Is implements interface{ Is(error) bool }, consulted by errors.Is: _error
+// carries a func field and is not comparable, so identity falls back to the
+// carried concrete values.
+func (w _error) Is(target error) bool {
+	t, ok := target.(_error)
+	if !ok {
+		return false
+	}
+	return bridgeValuesIdentical(w.IValue, t.IValue)
+}
+
+// _errorCell is the out-parameter box for error-implementing interpreted
+// pointees: a pointer to it crosses an any slot where native code walks an
+// error chain and stores a matched link (errors.As). The embedded _error
+// provides Error (and As, Is); Want is the native type the interpreted
+// target cell can hold. The field shape deliberately differs from an
+// interface wrapper box (no IValue first field), so re-entry paths never
+// mistake it for a value-carrying box; the write-back reads it explicitly.
+type _errorCell struct {
+	_error
+	Want reflect.Type
+}
+
+// bridgeValuesIdentical compares the concrete values carried by two boxes.
+func bridgeValuesIdentical(a, b any) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	av, aok := unwrapBridgeCarrier(a)
+	bv, bok := unwrapBridgeCarrier(b)
+	if !aok || !bok {
+		return a == b
+	}
+	if av.Type() != bv.Type() {
+		return false
+	}
+	if vi, ok := av.Interface().(valueInterface); ok {
+		if _, ok := bv.Interface().(valueInterface); !ok {
+			return false
+		}
+		return vi.value.IsValid() && vi.value.Equal(bv.Interface().(valueInterface).value)
+	}
+	return av.Equal(bv)
+}
+
+// unwrapBridgeCarrier returns the reflect.Value of a box-carried concrete
+// value, seeing through bridge boxes whose IValue holds a valueInterface.
+func unwrapBridgeCarrier(c any) (reflect.Value, bool) {
+	v := reflect.ValueOf(c)
+	if !v.IsValid() {
+		return v, false
+	}
+	if vi, ok := c.(valueInterface); ok {
+		return vi.value, vi.value.IsValid()
+	}
+	if isInterfaceWrapperType(v.Type()) {
+		iv := v.Field(0)
+		if inner, ok := iv.Interface().(valueInterface); ok {
+			return inner.value, inner.value.IsValid()
+		}
+		return iv.Elem(), true
+	}
+	return v, true
+}
 
 // Panic is an error recovered from a panic call in interpreted code.
 type Panic struct {

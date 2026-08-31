@@ -345,6 +345,15 @@ func (interp *Interpreter) executeWithPublication(p *Program, cancel <-chan stru
 			res = genFunctionWrapper(n)(f)
 		}
 	}
+	// Re-box an interpreted-interface result for the host: never leak the
+	// valueInterface wrapper across the API boundary. The cell itself is
+	// untouched; the host receives a native bridge box when the value's
+	// method set satisfies a registered host interface, a catalog box when
+	// it satisfies a known native interface, and the raw concrete value
+	// otherwise. This must run before the ownership sweeps, so they see
+	// exactly what the host receives.
+	res = interp.bridgeEvalResult(res, f)
+	res = interp.bridgeEvalResultRaw(res, f)
 	if !publication.request() {
 		interp.sweepRootOwnedChannels(f)
 		interp.sweepRootInterpretedFuncs(f, reflect.Value{})

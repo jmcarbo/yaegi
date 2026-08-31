@@ -170,6 +170,14 @@ func (interp *Interpreter) Use(values Exports) error {
 		}
 	}
 
+	// Arm the json marshaler used by the inout deep bridge when the
+	// encoding/json symbols are available.
+	if p := interp.binPkg["encoding/json"]; p != nil {
+		if m, ok := p["Marshal"]; ok && m.IsValid() && m.Kind() == reflect.Func {
+			jsonMarshalFunc.Store(m.Interface().(func(any) ([]byte, error)))
+		}
+	}
+
 	// Checks if input values correspond to stdlib packages by looking for one
 	// well known stdlib package path.
 	if _, ok := values["fmt/fmt"]; ok {

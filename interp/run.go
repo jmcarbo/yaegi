@@ -9,6 +9,7 @@ import (
 	"go/token"
 	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 	"unsafe"
 )
@@ -786,6 +787,16 @@ func typeAssert(n *node, withResult, withOk bool) {
 		n.exec = func(f *frame) bltn {
 			valf := value(f)
 			v, ok := valf.Interface().(valueInterface)
+			if !ok {
+				// The source may be a raw concrete value or a bridge box
+				// which came back from binary land: recover the interpreted
+				// view, so the assertion can consult the interpreted method
+				// set again.
+				if v2, rv, ok2 := f.interp.recoverInterpretedView(valf); ok2 {
+					v, valf = v2, rv
+					ok = true
+				}
+			}
 			if withOk {
 				defer finishStatus(f, &ok)
 			}
@@ -928,6 +939,18 @@ func typeAssert(n *node, withResult, withOk bool) {
 			if vv, ok := concrete.(valueInterface); ok {
 				ctyp = vv.value.Type()
 				concrete = vv.value.Interface()
+			} else if _, isBox := unbridgeValue(reflect.ValueOf(concrete)); isBox {
+				// A bridge box carries the concrete interpreted value: the
+				// assertion must see through it, as native code would.
+				if vv, _, ok := f.interp.recoverInterpretedView(val); ok && vv.value.IsValid() {
+					ctyp = vv.value.Type()
+					concrete = vv.value.Interface()
+					if isInterfaceSrc(typ) {
+						vi := valueInterface{node: vv.node, value: vv.value}
+						concrete = vi
+						ctyp = vi.value.Type()
+					}
+				}
 			}
 			ok = canAssertTypes(ctyp, rtype)
 			if !ok {
@@ -1695,6 +1718,7 @@ func invokeInterpretedHostBoundary(interp *Interpreter, typ reflect.Type, invoke
 		interp.publishHostValues(out...)
 	}()
 	out = invoke(in, root, cancel)
+	interp.bridgeHostResults(out, root)
 	return out
 }
 
@@ -1901,7 +1925,10 @@ func genInterfaceWrapper(n *node, typ reflect.Type) func(*frame) reflect.Value {
 				panic(n.cfgErrorf("method not found: %s", names[i]))
 			}
 			nod := *m
-			nod.recv = &receiver{n, v, indexes[i]}
+			// Bind the receiver as the carried value: re-resolving through
+			// the node would read the argument cell at invoke time, which
+			// may hold a different value than the one this box wraps.
+			nod.recv = &receiver{val: v, index: indexes[i]}
 			w.Field(i + 1).Set(genFunctionWrapper(&nod)(f))
 		}
 		return w
@@ -2309,6 +2336,9 @@ func callBin(n *node) {
 		return v
 	}
 	var values []func(*frame) reflect.Value
+	// bridgeAfters records the write-back of out-parameter bridges keyed by
+	// the argument index; it is nil unless an out bridge was generated.
+	var bridgeAfters map[int]func(*frame, reflect.Value)
 	funcType := c0.typ.rtype
 	wt := wrappedType(c0)
 	variadic := -1
@@ -2326,6 +2356,30 @@ func callBin(n *node) {
 	// getMapType returns a reflect type suitable for interface wrapper for functions
 	// with some special processing in case of interface{} argument, i.e. fmt.Printf.
 	var getMapType func(*itype) reflect.Type
+	var getDeepType func(*itype) reflect.Type
+	var getWrapType func(*itype) reflect.Type
+	var deepInout bool
+	if spec, ok := deepBridgePolicy[c0.rval]; ok {
+		if spec.wrap {
+			lr := spec.lr
+			getWrapType = func(typ *itype) reflect.Type {
+				for _, rt := range lr {
+					if typ.implements(&itype{cat: valueT, rtype: rt}) {
+						return rt
+					}
+				}
+				return nil
+			}
+		}
+		// Container bridge policy for marshal/unmarshal style functions (see
+		// bridge.go): contents satisfying the interfaces are bridged per
+		// element (upstream issue #1486).
+		lr := spec.lr
+		deepInout = spec.inout
+		getDeepType = func(typ *itype) reflect.Type {
+			return deepBridgeMatch(typ, lr, 0)
+		}
+	}
 	if lr, ok := n.interp.mapTypes[c0.rval]; ok {
 		getMapType = func(typ *itype) reflect.Type {
 			for _, rt := range lr {
@@ -2382,6 +2436,15 @@ func callBin(n *node) {
 			var defType reflect.Type
 			if variadic >= 0 && i+rcvrOffset >= variadic {
 				defType = funcType.In(variadic)
+				// A variadic argument is bound to a single element of the
+				// variadic slice. When that element type is a non-empty
+				// interface, wrap the argument against the element type: the
+				// slice type itself has no interface wrapper, leaving it
+				// unchanged would pass a raw value which reflect cannot
+				// assign to the element interface (e.g. errors.Join).
+				if et := defType.Elem(); et.Kind() == reflect.Interface && et.NumMethod() > 0 {
+					defType = et
+				}
 			} else {
 				defType = funcType.In(rcvrOffset + i)
 			}
@@ -2389,9 +2452,21 @@ func callBin(n *node) {
 			// interface arguments (including elements of a variadic empty
 			// interface parameter): a wrapper type of another interface
 			// would not match a non empty interface parameter at call time.
-			if getMapType != nil && (defType == emptyInterfaceType ||
+			// A pointer-to-pointer argument is excluded: its method set
+			// leaks the pointee methods, and binding a wrapper on it would
+			// use the wrong receiver. Such arguments are the realm of the
+			// out-parameter bridge (see genValueOutErrorBridge).
+			isPtrToPtr := isPtrSrc(c.typ) && isPtrSrc(c.typ.val)
+			deferOrGo := n.anc.kind == deferStmt || n.anc.kind == goStmt
+			if getMapType != nil && !isPtrToPtr && (defType == emptyInterfaceType ||
 				(defType.Kind() == reflect.Slice && defType.Elem() == emptyInterfaceType)) {
 				if rt := getMapType(c.typ); rt != nil {
+					defType = rt
+				}
+			}
+			if getWrapType != nil && !isPtrToPtr && (defType == emptyInterfaceType ||
+				(defType.Kind() == reflect.Slice && defType.Elem() == emptyInterfaceType)) {
+				if rt := getWrapType(c.typ); rt != nil {
 					defType = rt
 				}
 			}
@@ -2409,11 +2484,23 @@ func callBin(n *node) {
 			switch {
 			case isEmptyInterface(c.typ):
 				if unwrap {
+					if getDeepType != nil && !deferOrGo && !deepInout && getDeepType(c.typ) != nil {
+						values = append(values, genValueDeepBridge(c, c.typ, deepBridgePolicy[c0.rval].lr))
+						break
+					}
 					values = append(values, genValueConcrete(getMapType, c))
 					break
 				}
 				values = append(values, genValue(c))
 			case isInterfaceSrc(c.typ):
+				if defType != valueInterfaceType && defType.Kind() == reflect.Interface && defType.NumMethod() > 0 {
+					// A non-empty binary interface parameter needs a genuine
+					// implementer: the raw concrete value stripped out of the
+					// interpreted interface wrapper would be rejected by
+					// reflect.Call.
+					values = append(values, genInterfaceWrapper(c, defType))
+					break
+				}
 				values = append(values, genValueInterfaceValue(c))
 			case isFuncSrc(c.typ):
 				values = append(values, genFunctionWrapper(c))
@@ -2426,6 +2513,37 @@ func callBin(n *node) {
 			case isPtrSrc(c.typ):
 				if c.typ.val.cat == valueT {
 					values = append(values, genValue(c))
+				} else if unwrap && isPtrToPtr && isOutErrorBridge(getMapType, c) && !deferOrGo && len(c.child) > 0 {
+					idx := len(values)
+					values = append(values, genValueOutErrorBridge(c))
+					if bridgeAfters == nil {
+						bridgeAfters = map[int]func(*frame, reflect.Value){}
+					}
+					bridgeAfters[idx] = writeBackOutErrorBridge(c)
+				} else if unwrap && defType.Kind() == reflect.Interface && defType.NumMethod() > 0 &&
+					defType != valueInterfaceType && !isPtrToPtr &&
+					c.typ.val.cat != valueT && c.typ.val.cat != errorT &&
+					c.typ.val.implements(&itype{cat: valueT, rtype: defType}) {
+					// The pointer's pointee satisfies the parameter interface:
+					// bind the wrapper through the pointer and pass a pointer
+					// to the box, so out-style native code (json.Unmarshal)
+					// finds an addressable implementer writing through to the
+					// interpreted value.
+					values = append(values, genPtrAliasInterfaceWrapper(c, defType))
+				} else if unwrap && getDeepType != nil && !deferOrGo && !deepInout && getDeepType(c.typ) != nil {
+					// Read-only marshal of a pointer to a container with
+					// bridged contents.
+					values = append(values, genValueDeepBridge(c, c.typ, deepBridgePolicy[c0.rval].lr))
+				} else if unwrap && getDeepType != nil && !deferOrGo && deepInout && len(c.child) > 0 && getDeepType(c.typ.val) != nil {
+					// Unmarshal-style target pointer to a container whose
+					// leaves satisfy the callee interfaces: mirror + write-back.
+					idx := len(values)
+					arg, after := genValueInOutDeepBridge(c, c.typ, deepBridgePolicy[c0.rval].lr)
+					values = append(values, arg)
+					if bridgeAfters == nil {
+						bridgeAfters = map[int]func(*frame, reflect.Value){}
+					}
+					bridgeAfters[idx] = after
 				} else {
 					values = append(values, genInterfaceWrapper(c, defType))
 				}
@@ -2437,6 +2555,10 @@ func callBin(n *node) {
 				values = append(values, genValue(c))
 			default:
 				if unwrap {
+					if getDeepType != nil && !deferOrGo && !deepInout && getDeepType(c.typ) != nil {
+						values = append(values, genValueDeepBridge(c, c.typ, deepBridgePolicy[c0.rval].lr))
+						break
+					}
 					values = append(values, genValueConcrete(getMapType, c))
 					break
 				}
@@ -2502,6 +2624,12 @@ func callBin(n *node) {
 			if f.canceled() {
 				return nil
 			}
+			callWithFuncSweepFenceReleased(f, func() []reflect.Value {
+				for i, after := range bridgeAfters {
+					after(f, in[i])
+				}
+				return nil
+			})
 			b := res[0].Bool()
 			getFrame(f, level).data[index].SetBool(b)
 			if b {
@@ -2544,6 +2672,12 @@ func callBin(n *node) {
 				if f.canceled() {
 					return nil
 				}
+				callWithFuncSweepFenceReleased(f, func() []reflect.Value {
+					for i, after := range bridgeAfters {
+						after(f, in[i])
+					}
+					return nil
+				})
 				for i, v := range rvalues {
 					if v == nil {
 						continue // Skip assign "_".
@@ -2584,6 +2718,12 @@ func callBin(n *node) {
 				if f.canceled() {
 					return nil
 				}
+				callWithFuncSweepFenceReleased(f, func() []reflect.Value {
+					for i, after := range bridgeAfters {
+						after(f, in[i])
+					}
+					return nil
+				})
 				for i, v := range out {
 					dest := f.data[b+i]
 					if _, ok := dest.Interface().(valueInterface); ok {
@@ -2610,6 +2750,12 @@ func callBin(n *node) {
 				if f.canceled() {
 					return nil
 				}
+				callWithFuncSweepFenceReleased(f, func() []reflect.Value {
+					for i, after := range bridgeAfters {
+						after(f, in[i])
+					}
+					return nil
+				})
 				for i := 0; i < len(out); i++ {
 					r := out[i]
 					if r.Kind() == reflect.Func {
@@ -2645,6 +2791,197 @@ func getIndexBinMethod(n *node) {
 		getFrame(f, l).data[i] = receiver.Method(m)
 		return next
 	}
+}
+
+var reflectValueType = reflect.TypeOf(reflect.Value{})
+
+// isReflectMethodBridgeTarget returns true if the selector is a binary method
+// of the reflect.Value method introspection family (upstream issue #847):
+// Method, MethodByName and NumMethod. Those methods must be bridged at the
+// interpreter level when the introspected content is an interpreted value
+// which has been unwrapped for a binary empty interface parameter, because the
+// raw concrete value seen by reflect carries no method. Type-level
+// introspection (on a reflect.Type receiver) is intentionally not bridged:
+// interface method signatures carry no receiver, and faking reflect.Type
+// results is not sound.
+func isReflectMethodBridgeTarget(rtype reflect.Type, name string) bool {
+	if rtype != reflectValueType {
+		return false
+	}
+	switch name {
+	case "Method", "MethodByName", "NumMethod":
+		return true
+	}
+	return false
+}
+
+// getIndexBinValueMethod is like getIndexBinMethod, specialized for the
+// reflect.Value method introspection family: Method, MethodByName and
+// NumMethod. When the introspected content maps back to an interpreted type
+// (see Interpreter.rtoitype), the returned value is built by the interpreter
+// instead of reflect, so interpreted methods are visible. The native behavior
+// is used otherwise, and as a fallback for methods which are not defined by
+// the interpreted type.
+func getIndexBinValueMethod(n *node) {
+	i := n.findex
+	l := n.level
+	m := n.val.(int)
+	// The introspection method name, recovered from the static method
+	// signature of the selector (the receiver type is the first input).
+	name := n.typ.rtype.In(0).Method(m).Name
+	value := genValue(n.child[0])
+	next := getExec(n.tnext)
+
+	n.exec = func(f *frame) bltn {
+		receiver := cloneCallArgValue(value(f))
+		f.interp.markOwnedValuesHostSharedFromExec(receiver)
+		if out, ok := bridgeReflectMethod(f, receiver, n.typ.rtype, name, m); ok {
+			getFrame(f, l).data[i] = out
+			return next
+		}
+		getFrame(f, l).data[i] = receiver.Method(m)
+		return next
+	}
+}
+
+// bridgeReflectMethod builds the result of reflect.Value Method, MethodByName
+// or NumMethod applied to an interpreted value. The second result tells if the
+// bridge engaged; if not, the caller must fall back to the native reflect
+// method.
+func bridgeReflectMethod(f *frame, receiver reflect.Value, sig reflect.Type, name string, index int) (reflect.Value, bool) {
+	if receiver.Kind() != reflect.Struct || receiver.Type() != reflectValueType {
+		return reflect.Value{}, false
+	}
+	inner, ok := receiver.Interface().(reflect.Value)
+	if !ok || !inner.IsValid() {
+		return reflect.Value{}, false
+	}
+	if f.interp.rtypeItype(inner.Type()) == nil {
+		return reflect.Value{}, false
+	}
+	// Compute the merged method set: interpreted exported methods shadow
+	// natively visible (promoted) ones, and the whole set is sorted by name,
+	// as native reflect does.
+	names := bridgedMethodNames(f, inner)
+	switch name {
+	case "NumMethod":
+		return reflect.MakeFunc(stripFuncRecv(sig), func(in []reflect.Value) []reflect.Value {
+			return []reflect.Value{reflect.ValueOf(len(names))}
+		}), true
+	case "Method":
+		return reflect.MakeFunc(stripFuncRecv(sig), func(in []reflect.Value) []reflect.Value {
+			i := int(in[0].Int())
+			if i < 0 || i >= len(names) {
+				return []reflect.Value{reflect.Zero(sig.Out(0))}
+			}
+			return []reflect.Value{boxValue(bindBridgedMethod(f, inner, names[i]))}
+		}), true
+	case "MethodByName":
+		return reflect.MakeFunc(stripFuncRecv(sig), func(in []reflect.Value) []reflect.Value {
+			return []reflect.Value{boxValue(bindBridgedMethod(f, inner, in[0].String()))}
+		}), true
+	}
+	return reflect.Value{}, false
+}
+
+// stripFuncRecv removes the receiver from a binary method signature obtained
+// from reflect.Type, to get the signature of the corresponding method value.
+func stripFuncRecv(sig reflect.Type) reflect.Type {
+	in := make([]reflect.Type, sig.NumIn()-1)
+	for i := range in {
+		in[i] = sig.In(i + 1)
+	}
+	out := make([]reflect.Type, sig.NumOut())
+	for i := range out {
+		out[i] = sig.Out(i)
+	}
+	return reflect.FuncOf(in, out, sig.IsVariadic())
+}
+
+// bridgedMethodNames returns the sorted names of the method set visible on an
+// interpreted value through the bridge: interpreted exported methods (value
+// receiver only, unless the value is a pointer or addressable), plus the
+// natively visible ones (promoted from embedded binary types). Interpreted
+// methods shadow native ones of the same name.
+func bridgedMethodNames(f *frame, inner reflect.Value) []string {
+	seen := map[string]bool{}
+	names := []string{}
+	add := func(nm string) {
+		if !seen[nm] {
+			seen[nm] = true
+			names = append(names, nm)
+		}
+	}
+	// Native methods, from promoted embedded binary types.
+	if t := inner.Type(); t != nil {
+		for i := 0; i < t.NumMethod(); i++ {
+			add(t.Method(i).Name)
+		}
+	}
+	// Interpreted methods, direct and promoted through embedded fields.
+	collectItypeMethods(f.interp.rtypeItype(inner.Type()), inner, map[*itype]bool{}, seen, &names)
+	sort.Strings(names)
+	return names
+}
+
+// collectItypeMethods gathers exported method names of an interpreted type and
+// recursively of its embedded fields, filtered by the same rules as native
+// reflect: pointer receiver methods are only visible if the value is a pointer
+// or addressable.
+func collectItypeMethods(t *itype, inner reflect.Value, visited map[*itype]bool, seen map[string]bool, names *[]string) {
+	if t == nil || visited[t] {
+		return
+	}
+	visited[t] = true
+	add := func(nm string) {
+		if !seen[nm] {
+			seen[nm] = true
+			*names = append(*names, nm)
+		}
+	}
+	for _, m := range t.method {
+		if m == nil || !token.IsExported(m.ident) {
+			continue
+		}
+		if isPtrRecvMethod(m) && inner.Kind() != reflect.Ptr && !inner.CanAddr() {
+			continue
+		}
+		add(m.ident)
+	}
+	for _, fl := range t.field {
+		if fl.embed {
+			et := fl.typ
+			if et != nil && et.cat == ptrT {
+				et = et.val
+			}
+			collectItypeMethods(et, inner, visited, seen, names)
+		}
+	}
+}
+
+// boxValue wraps a value in a reflect.Value of type reflect.Value, as expected
+// by MakeFunc for the result of a func(...) reflect.Value signature.
+func boxValue(v reflect.Value) reflect.Value {
+	return reflect.ValueOf(&v).Elem()
+}
+
+// bindBridgedMethod binds the interpreted method name to the receiver value
+// inner and returns it as a native func value, or falls back to the native
+// reflect method value if the method is not interpreted (promoted from an
+// embedded binary type).
+func bindBridgedMethod(f *frame, inner reflect.Value, name string) reflect.Value {
+	if token.IsExported(name) {
+		if it := f.interp.rtypeItype(inner.Type()); it != nil {
+			m, lind := it.lookupMethod(name)
+			if m != nil && !(isPtrRecvMethod(m) && inner.Kind() != reflect.Ptr && !inner.CanAddr()) {
+				nod := *m
+				nod.val = &nod
+				nod.recv = &receiver{val: inner, index: lind}
+				return genFunctionWrapper(&nod)(f)
+			}
+		}
+	}
+	return inner.MethodByName(name)
 }
 
 func getIndexBinElemMethod(n *node) {
@@ -3048,6 +3385,12 @@ func getMethodByName(n *node) {
 		// The interface object must be directly accessible, or embedded in a struct (exported anonymous field).
 		val0 := value0(f)
 		val, ok := value0(f).Interface().(valueInterface)
+		if !ok {
+			if v2, _, ok2 := f.interp.recoverInterpretedView(val0); ok2 && v2.node != nil {
+				val = v2
+				ok = true
+			}
+		}
 		if !ok {
 			// Search the first embedded valueInterface.
 			for val0.Kind() == reflect.Ptr {

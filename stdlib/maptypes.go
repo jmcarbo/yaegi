@@ -4,6 +4,7 @@ import (
 	"encoding"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"log"
 	"reflect"
@@ -33,6 +34,10 @@ func init() {
 	MapTypes[reflect.ValueOf(log.Panicf)] = mt
 	MapTypes[reflect.ValueOf(log.Panicln)] = mt
 
+	MapTypes[reflect.ValueOf(errors.As)] = []reflect.Type{
+		reflect.TypeOf((*error)(nil)).Elem(),
+	}
+
 	mt = []reflect.Type{reflect.TypeOf((*fmt.Scanner)(nil)).Elem()}
 
 	MapTypes[reflect.ValueOf(fmt.Scan)] = mt
@@ -47,6 +52,10 @@ func init() {
 		reflect.TypeOf((*json.Unmarshaler)(nil)).Elem(),
 		reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem(),
 	}
+	MapTypes[reflect.ValueOf(new(json.Encoder).Encode)] = []reflect.Type{
+		reflect.TypeOf((*json.Marshaler)(nil)).Elem(),
+		reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem(),
+	}
 	MapTypes[reflect.ValueOf(xml.Marshal)] = []reflect.Type{
 		reflect.TypeOf((*xml.Marshaler)(nil)).Elem(),
 		reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem(),
@@ -54,5 +63,9 @@ func init() {
 	MapTypes[reflect.ValueOf(xml.Unmarshal)] = []reflect.Type{
 		reflect.TypeOf((*xml.Unmarshaler)(nil)).Elem(),
 		reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem(),
+	}
+	MapTypes[reflect.ValueOf(new(xml.Encoder).Encode)] = []reflect.Type{
+		reflect.TypeOf((*xml.Marshaler)(nil)).Elem(),
+		reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem(),
 	}
 }
