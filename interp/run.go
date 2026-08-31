@@ -485,28 +485,42 @@ func runCfg(n *node, f *frame, funcNode, callNode *node) {
 		recovered = f.recovered
 		f.mutex.Unlock()
 		// Revert the function literal slots when this frame exits. The restore
-		// is the only frame-cell writer outside an exec step, so it must hold
-		// the funcSweep fence (read mode) like every step: the incremental
-		// sweep reads capture cells unfenced, trusting the fence for
-		// exclusivity. The fence cannot be held here (the last step released
-		// it and the drain counters are closed), so the read lock is safe.
-		// Skipped when another activation shares this frame's cells through a
-		// lexical clone (a goroutine or closure activation whose cloneOf chain
-		// points at this frame): the shared cell may still be read through the
-		// clone, and such an entry simply stays sweep/purge reclaimable.
-		f.interp.funcMu.Lock()
-		lastActivation := f.interp.activeFrames[f] <= 1
-		for active := range f.interp.activeFrames {
-			if active != f && frameSharesSlotsWith(active, f) {
-				lastActivation = false
-				break
+		// is the only frame-cell writer in the activation-exit path, so it
+		// holds the funcSweep fence (read mode) like every step: the
+		// incremental sweep reads capture cells unfenced, trusting the fence
+		// for exclusivity against this write. (The closure invoker's own slot
+		// restore in buildClosureWrapper is a second, master-parity unfenced
+		// frame-cell writer; it predates this change and is not covered by
+		// this bracket.) The fence cannot be held here (the last step released
+		// it and the drain counters are closed), so the read lock is safe, and
+		// it is released by defer like every other fence bracket. Skipped when
+		// another activation shares this frame's cells through a lexical clone
+		// (a goroutine or closure activation whose cloneOf chain points at
+		// this frame): the shared cell may still be read through the clone,
+		// and such an entry simply stays sweep/purge reclaimable. Frames that
+		// executed no literal pay only the funcSlots check.
+		if len(f.funcSlots) > 0 {
+			f.mutex.RLock()
+			pending := f.funcSlots
+			f.mutex.RUnlock()
+			if len(pending) > 0 {
+				f.interp.funcMu.Lock()
+				lastActivation := f.interp.activeFrames[f] <= 1
+				for active := range f.interp.activeFrames {
+					if active != f && frameSharesSlotsWith(active, f) {
+						lastActivation = false
+						break
+					}
+				}
+				f.interp.funcMu.Unlock()
+				if lastActivation {
+					func() {
+						f.interp.funcSweepMu.RLock()
+						defer f.interp.funcSweepMu.RUnlock()
+						applyFuncSlotRestores(f)
+					}()
+				}
 			}
-		}
-		f.interp.funcMu.Unlock()
-		if lastActivation {
-			f.interp.funcSweepMu.RLock()
-			applyFuncSlotRestores(f)
-			f.interp.funcSweepMu.RUnlock()
 		}
 		// Deregister the activation only AFTER the full release sequence and
 		// BEFORE the repanic: while this frame's deferred calls drain —

@@ -41,9 +41,10 @@ func TestGorneshRootIIFEEvalAddsNoGlobalSlot(t *testing.T) {
 
 // TestGorneshRootIIFEEvalResultSlotMatchesExprBaseline: a result-bearing IIFE
 // must not add the literal's own registry slots on top of the ordinary
-// call-expression result slot. Its per-Eval growth must match a plain
+// call-expression result slot. Its per-Eval growth must equal a plain
 // `len("ab")` style root-level call Eval (the pre-existing expression-slot
-// mechanism), not the +3/Eval of the registry path.
+// mechanism: exactly one result slot per Eval), not the +3/Eval of the
+// registry path.
 func TestGorneshRootIIFEEvalResultSlotMatchesExprBaseline(t *testing.T) {
 	i := New(Options{})
 	const runs = 100
@@ -63,8 +64,8 @@ func TestGorneshRootIIFEEvalResultSlotMatchesExprBaseline(t *testing.T) {
 		}
 	}
 	after := globalFrameSlotsGornesh(t, j)
-	if after-jbase > exprGrowth {
-		t.Fatalf("result IIFE Evals grew the global frame by %d slots, want at most the %d of an ordinary call expression", after-jbase, exprGrowth)
+	if after-jbase != exprGrowth {
+		t.Fatalf("result IIFE Evals grew the global frame by %d slots over %d Evals, want exactly the %d of an ordinary call expression", after-jbase, runs, exprGrowth)
 	}
 }
 

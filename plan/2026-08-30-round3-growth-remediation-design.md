@@ -190,7 +190,8 @@ literal or IIFE) permanently adds +1..+3 global-frame slots on this branch
 retry returned the synthetic-main FuncDecl (function scope, no global slots)
 but replayed it on every later Eval; the PR's anti-replay fix returns the
 wrapper BODY (ast.go ~619), compiling the statements in the global scope where
-`case funcLit: n.findex = sc.add(n.typ)` (cfg.go ~574) permanently extends the
+`case funcLit: n.findex = sc.add(n.typ)` (cfg.go ~583, the else branch of the
+isRootImmediateFuncLit gate) permanently extends the
 global frame.
 
 Dead ends (attempted and reverted): (a) wrapping the body in a one-shot void

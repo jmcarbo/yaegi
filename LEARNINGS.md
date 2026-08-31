@@ -93,9 +93,11 @@
   leftover finalizer first because sweeps and purges may delete an entry
   while its wrapper is still alive (the binder re-registers such aliases).
   Implementation hazards found on the way, all load-bearing: (1) the
-  finalizer closure must capture only scalars — capturing the funcvalRef
-  struct captures the typed funcval pointer, and the finalizer itself then
-  keeps the wrapper alive forever; (2) the metadata payload pinned its own
+  finalizer closure must never capture the funcvalRef struct (or any
+  pointer derived from the wrapper) — capturing it captures the typed
+  funcval pointer, and the finalizer itself then keeps the wrapper alive
+  forever; capturing the interpreter, key, and generation is required and
+  safe; (2) the metadata payload pinned its own
   wrapper through two edges — the invoker keeps the creating frame alive
   and the frame's literal slot kept the wrapper, now reverted by restoring
   literal slots when a frame's last runCfg activation exits (root-frame
@@ -111,18 +113,25 @@
   the manual reclamation path; the weak registry removes the registry
   itself, its alias keys, and the bound-wrapper cache as independent
   retainers. Isolation suites re-run green under -race. Review follow-ups
-  (2026-08-31): the exit-time slot restore is the only frame-cell writer
-  outside an exec step, so it holds the funcSweep fence in read mode — the
-  incremental sweep's capture-cell reads are unfenced and trust the fence
-  for exclusivity — and it is skipped when another active activation
-  reaches the frame through ancestry or a cloneOf link (shared copied cell
-  headers keep master-like semantics for goroutine/recursive-closure
-  cases; such entries stay sweep/purge reclaimable). directFuncs
-  activations store their funcval key eagerly so eviction paths never
-  derive keys (an allocation) under funcMu. The funcval address-reuse
-  guard is belt-and-braces: the runtime never reuses a funcval address
-  before its finalizer has executed, so a stale finalizer and a fresh
-  registration cannot coexist at one key.
+  (2026-08-31): the exit-time slot restore is the only frame-cell writer in
+  the activation-exit path, so it holds the funcSweep fence in read mode —
+  the incremental sweep's capture-cell reads are unfenced and trust the
+  fence for exclusivity against this write — and it is skipped when another
+  active activation reaches the frame through ancestry or a cloneOf link
+  (shared copied cell headers keep master-like semantics for
+  goroutine/recursive-closure cases; such entries stay sweep/purge
+  reclaimable). A second unfenced frame-cell writer predates this change
+  and remains master-parity: the closure invoker's own slot restore in
+  buildClosureWrapper runs on host goroutines and inside fence-released
+  native calls, so its exclusivity against the sweep's unfenced reads is
+  not fence-based. directFuncs activations store their funcval key eagerly
+  so eviction paths never derive keys (an allocation) under funcMu. The
+  finalizer closure must never capture the funcvalRef (or any pointer
+  derived from the wrapper) — capturing the interpreter, key, and
+  generation is required and safe. The funcval address-reuse guard is
+  belt-and-braces: the runtime never reuses a funcval address before its
+  finalizer has executed, so a stale finalizer and a fresh registration
+  cannot coexist at one key.
 - Reentrancy for the execution gate is an explicit token scoped to the
   goroutine running the execution, not a native stack probe: any goroutine
   running interpreted code has runCfg on its stack, including goroutines

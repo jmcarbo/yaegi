@@ -3718,6 +3718,12 @@ func (c *detachedRootCloner) commitTargeted(owner *frame) {
 	if owner == nil {
 		owner = c.newRoot
 	}
+	// Derive the clone activations before funcMu: each derivation allocates,
+	// and the clones are alive here on the calling stack.
+	cloneActivations := make([]directFuncActivation, 0, len(c.funcClones))
+	for _, clone := range c.funcClones {
+		cloneActivations = append(cloneActivations, newDirectFuncActivation(clone.value))
+	}
 	c.interp.funcMu.Lock()
 	defer c.interp.funcMu.Unlock()
 	for key, obj := range c.newObjects {
@@ -3737,7 +3743,7 @@ func (c *detachedRootCloner) commitTargeted(owner *frame) {
 		}
 		owner.ownedObjects[obj] = struct{}{}
 	}
-	for _, clone := range c.funcClones {
+	for i, clone := range c.funcClones {
 		newRef, ok := funcvalRefOf(clone.value)
 		if !ok {
 			continue
@@ -3751,7 +3757,7 @@ func (c *detachedRootCloner) commitTargeted(owner *frame) {
 			meta.group.root = owner.root
 		}
 		c.interp.insertFuncMetaEntryLocked(newRef, meta, owner)
-		cloneActivation := newDirectFuncActivation(clone.value)
+		cloneActivation := cloneActivations[i]
 		c.interp.directFuncs[directFuncActivationKey{source: clone.oldKey, root: owner.root}] = cloneActivation
 		c.interp.directFuncs[directFuncActivationKey{source: newRef.key, root: owner.root}] = cloneActivation
 		for lineageKey, active := range c.directLineage {
@@ -3803,8 +3809,11 @@ func (interp *Interpreter) activateDirectFuncFromExec(owner *frame, value reflec
 			clone = clone.Convert(value.Type())
 		}
 		cloner.commitTargeted(owner.root)
+		// Derived before funcMu: the clone is alive here and the derivation
+		// allocates.
+		activation := newDirectFuncActivation(clone)
 		interp.funcMu.Lock()
-		interp.directFuncs[cacheKey] = newDirectFuncActivation(clone)
+		interp.directFuncs[cacheKey] = activation
 		interp.armOwnedGCLocked()
 		interp.funcMu.Unlock()
 		activated = clone
