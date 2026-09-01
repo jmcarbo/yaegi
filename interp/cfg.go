@@ -1084,7 +1084,7 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				// synthetic root block scope, so identify its direct children too.
 				break
 			}
-			err = compDefineX(sc, n)
+			err = compDefineX(sc, n, false)
 
 		case binaryExpr:
 			wireChild(n)
@@ -1242,6 +1242,11 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 			if typ.Kind() == reflect.Map {
 				err = check.assignment(n.child[1], t.key, "map index")
 				n.gen = getIndexMap
+				if n.anc.action == aAssignX && childPos(n) == len(n.anc.child)-1 {
+					// Comma-ok map index: preserve the two-result gen which
+					// writes the ok flag into the second destination.
+					n.gen = getIndexMap2
+				}
 				break
 			}
 
@@ -2555,11 +2560,27 @@ func fixUntyped(nod *node, sc *scope) {
 	}, nil)
 }
 
-func compDefineX(sc *scope, n *node) error {
+// undefinedTypeError returns the error for a type which is referenced but not
+// defined (yet). The name of an incomplete type may be empty in its id, so
+// fall back to the raw type name.
+func undefinedTypeError(n *node, t *itype) error {
+	name := t.id()
+	if name == "" {
+		name = t.name
+	}
+	return n.cfgErrorf("undefined type: %s", name)
+}
+
+// compDefineX allocates frame slots and registers symbols for a defineX
+// statement (multiple names defined by a single value, i.e. the comma-ok
+// forms). It is called at global types analysis time for definitions at
+// package scope (global is true), and at CFG time for local definitions.
+func compDefineX(sc *scope, n *node, global bool) error {
 	l := len(n.child) - 1
 	types := []*itype{}
+	src := n.child[l]
 
-	switch src := n.child[l]; src.kind {
+	switch src.kind {
 	case callExpr:
 		funtype, err := nodeType(n.interp, sc, src.child[0])
 		if err != nil {
@@ -2594,7 +2615,50 @@ func compDefineX(sc *scope, n *node) error {
 		}
 
 	case indexExpr:
-		types = append(types, src.typ, sc.getType("bool"))
+		// The comma-ok form is valid only for a map index. The type of the
+		// indexed source may not be known yet at global types analysis time:
+		// compute it if CFG has not already done it.
+		c0 := src.child[0]
+		for c0.kind == parenExpr {
+			c0 = c0.child[0]
+		}
+		t := c0.typ
+		if t == nil || t.incomplete {
+			var err error
+			if t, err = nodeType(n.interp, sc, c0); err != nil {
+				return err
+			}
+		}
+		if c0.kind == starExpr && t != nil && t.cat == ptrT {
+			// nodeType of a deref expression wraps the inner type in a
+			// pointer: cancel it to get the type of the pointed value.
+			t = t.val
+		}
+		for t != nil && t.cat == linkedT {
+			t = t.val
+		}
+		if t == nil || t.incomplete {
+			// Come back when the source is defined.
+			return n.cfgErrorf("undefined: %s", src.child[0].name())
+		}
+		switch {
+		case t.cat == mapT:
+			t = t.val
+		case t.cat == ptrT && t.val != nil && t.val.cat == mapT:
+			t = t.val.val
+		case t.cat == valueT && t.rtype.Kind() == reflect.Map:
+			t = valueTOf(t.rtype.Elem())
+		default:
+			return n.cfgErrorf("assignment mismatch: %d variables but %s returns 1 value", l, src.kind)
+		}
+		if t == nil {
+			return n.cfgErrorf("undefined element type in map %s", src.child[0].name())
+		}
+		if !t.isComplete() {
+			// Come back when the type is known.
+			return undefinedTypeError(n, t)
+		}
+		types = append(types, t, sc.getType("bool"))
 		n.child[l].gen = getIndexMap2
 		n.gen = nop
 
@@ -2604,18 +2668,75 @@ func compDefineX(sc *scope, n *node) error {
 		} else {
 			n.child[l].gen = typeAssertLong
 		}
-		types = append(types, n.child[l].child[1].typ, sc.getType("bool"))
+		c1 := n.child[l].child[1]
+		if c1.typ == nil || c1.typ.incomplete {
+			// The asserted type may not be known yet at global types analysis
+			// time: compute it, as CFG would do.
+			var err error
+			if c1.typ, err = nodeType(n.interp, sc, c1); err != nil {
+				return err
+			}
+		}
+		if t := c1.typ; t == nil {
+			// Come back when the type is known.
+			return n.cfgErrorf("undefined type: %s", c1.ident)
+		} else if !t.isComplete() {
+			// Come back when the type is known.
+			return undefinedTypeError(n, t)
+		}
+		types = append(types, c1.typ, sc.getType("bool"))
 		n.gen = nop
 
 	case unaryExpr:
-		if n.child[l].action == aRecv {
-			types = append(types, src.typ, sc.getType("bool"))
+		if src.action == aRecv {
+			// The channel type may not be known yet at global types analysis
+			// time: compute it if CFG has not already done it.
+			c0 := src.child[0]
+			for c0.kind == parenExpr {
+				c0 = c0.child[0]
+			}
+			t := c0.typ
+			if t == nil || t.incomplete {
+				var err error
+				if t, err = nodeType(n.interp, sc, c0); err != nil {
+					return err
+				}
+			}
+			if t == nil || t.incomplete {
+				// Come back when the source is defined.
+				return n.cfgErrorf("undefined: %s", src.child[0].name())
+			}
+			if !t.isComplete() {
+				// Come back when the type is known.
+				return undefinedTypeError(n, t)
+			}
+			if !isChan(t) {
+				return n.cfgErrorf("invalid operation: cannot receive from non-channel %s", t.id())
+			}
+			// Set type to the channel data type.
+			if t.cat == valueT {
+				t = valueTOf(t.rtype.Elem())
+			} else {
+				t = t.val
+			}
+			if t == nil {
+				return n.cfgErrorf("undefined element type in channel %s", src.child[0].name())
+			}
+			if !t.isComplete() {
+				// Come back when the type is known.
+				return undefinedTypeError(n, t)
+			}
+			types = append(types, t, sc.getType("bool"))
 			n.child[l].gen = recv2
 			n.gen = nop
 		}
 
 	default:
 		return n.cfgErrorf("unsupported assign expression")
+	}
+
+	if len(types) != l {
+		return n.cfgErrorf("assignment mismatch: %d variables but %s returns %d values", l, src.kind, len(types))
 	}
 
 	// Handle redeclarations: find out new symbols vs existing ones.
@@ -2652,7 +2773,7 @@ func compDefineX(sc *scope, n *node) error {
 			n.child[i].redeclared = true
 		} else {
 			index = sc.add(t)
-			sc.sym[id] = &symbol{index: index, kind: varSym, typ: t}
+			sc.sym[id] = &symbol{index: index, kind: varSym, global: global, typ: t, node: n}
 		}
 		n.child[i].typ = t
 		n.child[i].findex = index
