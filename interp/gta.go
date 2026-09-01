@@ -167,7 +167,15 @@ func (interp *Interpreter) gta(root *node, rpath, importPath, pkgName string) ([
 				revisit = append(revisit, n)
 				return false
 			}
-			err = compDefineX(sc, n)
+			if err = compDefineX(sc, n, true); err != nil {
+				// The types of the right hand side may not be computable yet,
+				// for example when they depend on a type or a variable defined
+				// later in the package. Come back when dependencies are known.
+				n.meta = err
+				revisit = append(revisit, n)
+				err = nil
+				return false
+			}
 
 		case valueSpec:
 			if !isRootDefinition(n, root) {
